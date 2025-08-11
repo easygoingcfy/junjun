@@ -1,27 +1,49 @@
 from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget, QTableWidgetItem, QLineEdit, QHBoxLayout, QDateEdit, QMessageBox
 from PyQt5.QtCore import QDate
 from ui.plot_window import PlotWindow
+from ui.backtest_window import BacktestWindow
 from db.database import Database
 from data.fetcher import DataFetcher
-from strategy.selector import StockSelector
-import datetime
+from strategy.selector import StockSelector, StrategyConfig
+from PyQt5.QtWidgets import QGroupBox, QCheckBox, QRadioButton, QSpinBox, QComboBox
+# 新增用于详情弹窗的组件
+from PyQt5.QtWidgets import QDialog, QTextEdit, QDialogButtonBox, QFileDialog
+# 新增：用于颜色与对齐
+from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtGui import QColor
+# 新增：UI现代化组件（工具栏、停靠栏、滚动、搜索补全等）
+from PyQt5.QtWidgets import QDockWidget, QToolBar, QAction, QStatusBar, QScrollArea, QWidgetAction, QCompleter, QStyle, QHeaderView
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("A股选股分析工具")
-        self.resize(1000, 700)
+        self.resize(1280, 860)
         self.db = Database()
         self.fetcher = DataFetcher()
-        self.selector = StockSelector()
+        self.selector = StockSelector(self.db.conn)
+        # 主题与缓存
+        self._dark_theme = True
+        self._stock_list_cache = None
+        self._plot_windows = []
+        self._last_backtest = None
+        self.settings = QSettings("junjun", "A股选股分析工具")
         self.init_ui()
 
     def init_ui(self):
-        central = QWidget()
-        main_layout = QVBoxLayout()
+        # =============== 样式与状态栏 ===============
+        self.apply_theme(dark=True)
+        self.setStatusBar(QStatusBar(self))
+        self.info_label = QLabel("欢迎使用A股选股分析工具")
+        self.statusBar().addPermanentWidget(self.info_label, 1)
 
-        # 屏蔽前缀勾选区
-        from PyQt5.QtWidgets import QGroupBox, QCheckBox, QRadioButton, QSpinBox, QButtonGroup
+        # =============== 左侧：筛选器（放入可滚动 Dock） ===============
+        filters_container = QWidget()
+        filters_layout = QVBoxLayout()
+        filters_layout.setContentsMargins(8, 8, 8, 8)
+        filters_layout.setSpacing(8)
+
+        # --- 屏蔽前缀 ---
         block_group = QGroupBox("屏蔽股票前缀")
         block_layout = QHBoxLayout()
         self.prefix_checkboxes = []
@@ -31,9 +53,9 @@ class MainWindow(QMainWindow):
             self.prefix_checkboxes.append(cb)
             block_layout.addWidget(cb)
         block_group.setLayout(block_layout)
-        main_layout.addWidget(block_group)
+        filters_layout.addWidget(block_group)
 
-        # 日期选择区
+        # --- 日期区间 ---
         date_group = QGroupBox("日期区间")
         date_layout = QHBoxLayout()
         self.radio_recent = QRadioButton("最近N天")
@@ -54,9 +76,9 @@ class MainWindow(QMainWindow):
         date_layout.addWidget(QLabel("结束:"))
         date_layout.addWidget(self.date_end)
         date_group.setLayout(date_layout)
-        main_layout.addWidget(date_group)
+        filters_layout.addWidget(date_group)
 
-        # 涨幅筛选
+        # --- 涨幅筛选 ---
         filter_group = QGroupBox("涨幅筛选")
         filter_layout = QHBoxLayout()
         self.pct_input = QLineEdit()
@@ -67,150 +89,2207 @@ class MainWindow(QMainWindow):
         self.single_pct_input.setPlaceholderText("单日涨幅大于(%)，如8")
         filter_layout.addWidget(QLabel("单日涨幅大于:"))
         filter_layout.addWidget(self.single_pct_input)
+        self.single_days_spin = QSpinBox()
+        self.single_days_spin.setRange(1, 365)
+        self.single_days_spin.setValue(20)
+        filter_layout.addWidget(QLabel("在最近N天内:"))
+        filter_layout.addWidget(self.single_days_spin)
         filter_group.setLayout(filter_layout)
-        main_layout.addWidget(filter_group)
+        filters_layout.addWidget(filter_group)
 
-        # 按钮区
-        btn_layout = QHBoxLayout()
-        self.fetch_btn = QPushButton("获取全部股票")
-        self.select_btn = QPushButton("执行选股")
-        self.export_btn = QPushButton("导出选股结果")
-        btn_layout.addWidget(self.fetch_btn)
-        btn_layout.addWidget(self.select_btn)
-        btn_layout.addWidget(self.export_btn)
-        main_layout.addLayout(btn_layout)
+        # --- 成交量策略 ---
+        vol_group = QGroupBox("成交量")
+        vol_layout = QHBoxLayout()
+        self.volume_mode = QComboBox()
+        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])  # None | volume_breakout | volume_pullback
+        self.volume_ma_days = QSpinBox()
+        self.volume_ma_days.setRange(1, 60)
+        self.volume_ma_days.setValue(5)
+        self.volume_ratio_min = QLineEdit()
+        self.volume_ratio_min.setPlaceholderText("放量阈值，如1.5")
+        self.volume_ratio_max = QLineEdit()
+        self.volume_ratio_max.setPlaceholderText("缩量阈值，如0.7")
+        self.cb_pullback_red = QCheckBox("回调需收阴")
+        self.touch_ma_spin = QSpinBox()
+        self.touch_ma_spin.setRange(0, 250)
+        self.touch_ma_spin.setValue(0)
+        vol_layout.addWidget(QLabel("模式:"))
+        vol_layout.addWidget(self.volume_mode)
+        vol_layout.addWidget(QLabel("量均线N:"))
+        vol_layout.addWidget(self.volume_ma_days)
+        vol_layout.addWidget(QLabel("放量≥:"))
+        vol_layout.addWidget(self.volume_ratio_min)
+        vol_layout.addWidget(QLabel("缩量≤:"))
+        vol_layout.addWidget(self.volume_ratio_max)
+        vol_layout.addWidget(self.cb_pullback_red)
+        vol_layout.addWidget(QLabel("回踩MA(N=0关闭):"))
+        vol_layout.addWidget(self.touch_ma_spin)
+        vol_group.setLayout(vol_layout)
+        filters_layout.addWidget(vol_group)
 
-        # 信息与表格
-        self.info_label = QLabel("欢迎使用A股选股分析工具")
-        main_layout.addWidget(self.info_label)
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅"])
-        main_layout.addWidget(self.table)
+        # --- 均线系统 ---
+        ma_group = QGroupBox("均线系统")
+        ma_layout = QHBoxLayout()
+        self.ma_days_input = QLineEdit("5,10,20")
+        self.ma_align_combo = QComboBox()
+        self.ma_align_combo.addItems(["无", "多头", "空头"])  # None | long | short
+        self.price_above_ma_spin = QSpinBox()
+        self.price_above_ma_spin.setRange(0, 250)
+        self.price_above_ma_spin.setValue(0)
+        ma_layout.addWidget(QLabel("MA天数(逗号):"))
+        ma_layout.addWidget(self.ma_days_input)
+        ma_layout.addWidget(QLabel("排列:"))
+        ma_layout.addWidget(self.ma_align_combo)
+        ma_layout.addWidget(QLabel("价格在N日MA之上(0为关闭):"))
+        ma_layout.addWidget(self.price_above_ma_spin)
+        ma_group.setLayout(ma_layout)
+        filters_layout.addWidget(ma_group)
 
-        central.setLayout(main_layout)
+        # --- 热度 ---
+        heat_group = QGroupBox("热度(新闻条数)")
+        heat_layout = QHBoxLayout()
+        self.heat_min_news = QSpinBox()
+        self.heat_min_news.setRange(0, 100000)
+        self.heat_min_news.setValue(0)
+        self.heat_window = QSpinBox()
+        self.heat_window.setRange(1, 60)
+        self.heat_window.setValue(5)
+        heat_layout.addWidget(QLabel("最小新闻数:"))
+        heat_layout.addWidget(self.heat_min_news)
+        heat_layout.addWidget(QLabel("统计窗口N:"))
+        heat_layout.addWidget(self.heat_window)
+        heat_group.setLayout(heat_layout)
+        filters_layout.addWidget(heat_group)
+
+        # --- 技术条件 ---
+        tech_group = QGroupBox("技术条件")
+        tech_layout = QHBoxLayout()
+        self.breakout_n_spin = QSpinBox()
+        self.breakout_n_spin.setRange(0, 250)
+        self.breakout_n_spin.setValue(0)
+        self.breakout_min_pct = QLineEdit()
+        self.breakout_min_pct.setPlaceholderText("突破最小幅度% 可空")
+        self.atr_period_spin = QSpinBox()
+        self.atr_period_spin.setRange(0, 250)
+        self.atr_period_spin.setValue(0)
+        self.atr_max_pct = QLineEdit()
+        self.atr_max_pct.setPlaceholderText("ATR/价 ≤ % 可空")
+        self.cb_macd = QCheckBox("MACD")
+        self.macd_rule = QComboBox()
+        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
+        self.cb_rsi = QCheckBox("RSI")
+        self.rsi_period_spin = QSpinBox()
+        self.rsi_period_spin.setRange(1, 250)
+        self.rsi_period_spin.setValue(14)
+        self.rsi_min = QLineEdit()
+        self.rsi_min.setPlaceholderText("RSI≥ 可空")
+        self.rsi_max = QLineEdit()
+        self.rsi_max.setPlaceholderText("RSI≤ 可空")
+        tech_layout.addWidget(QLabel("N日新高N:"))
+        tech_layout.addWidget(self.breakout_n_spin)
+        tech_layout.addWidget(QLabel("最小突破%:"))
+        tech_layout.addWidget(self.breakout_min_pct)
+        tech_layout.addWidget(QLabel("ATR周期:"))
+        tech_layout.addWidget(self.atr_period_spin)
+        tech_layout.addWidget(QLabel("ATR/价≤%:"))
+        tech_layout.addWidget(self.atr_max_pct)
+        tech_layout.addWidget(self.cb_macd)
+        tech_layout.addWidget(self.macd_rule)
+        tech_layout.addWidget(self.cb_rsi)
+        tech_layout.addWidget(self.rsi_period_spin)
+        tech_layout.addWidget(self.rsi_min)
+        tech_layout.addWidget(self.rsi_max)
+        tech_group.setLayout(tech_layout)
+        filters_layout.addWidget(tech_group)
+
+        # --- 板块 ---
+        board_group = QGroupBox("板块")
+        board_layout = QHBoxLayout()
+        self.board_in_input = QLineEdit()
+        self.board_in_input.setPlaceholderText("包含板块代码/名称，逗号分隔")
+        self.board_out_input = QLineEdit()
+        self.board_out_input.setPlaceholderText("排除板块代码/名称，逗号分隔")
+        board_layout.addWidget(QLabel("包含:"))
+        board_layout.addWidget(self.board_in_input)
+        board_layout.addWidget(QLabel("排除:"))
+        board_layout.addWidget(self.board_out_input)
+        board_group.setLayout(board_layout)
+        filters_layout.addWidget(board_group)
+
+        # --- 形态 ---
+        pattern_group = QGroupBox("K线形态")
+        pattern_layout = QHBoxLayout()
+        self.cb_engulf = QCheckBox("吞没")
+        self.cb_hammer = QCheckBox("锤子线")
+        self.cb_shoot = QCheckBox("射击之星")
+        self.cb_doji = QCheckBox("十字星")
+        self.pattern_window_spin = QSpinBox()
+        self.pattern_window_spin.setRange(1, 60)
+        self.pattern_window_spin.setValue(5)
+        pattern_layout.addWidget(self.cb_engulf)
+        pattern_layout.addWidget(self.cb_hammer)
+        pattern_layout.addWidget(self.cb_shoot)
+        pattern_layout.addWidget(self.cb_doji)
+        pattern_layout.addWidget(QLabel("检测最近N根:"))
+        pattern_layout.addWidget(self.pattern_window_spin)
+        pattern_group.setLayout(pattern_layout)
+        filters_layout.addWidget(pattern_group)
+
+        # --- 评分权重 ---
+        weight_group = QGroupBox("评分权重（仅对启用项计分，自动归一化到100）")
+        weight_layout = QHBoxLayout()
+        self.weight_vol = QSpinBox()
+        self.weight_vol.setRange(0, 100)
+        self.weight_vol.setValue(30)
+        self.weight_ma = QSpinBox()
+        self.weight_ma.setRange(0, 100)
+        self.weight_ma.setValue(20)
+        self.weight_brk = QSpinBox()
+        self.weight_brk.setRange(0, 100)
+        self.weight_brk.setValue(25)
+        self.weight_pat = QSpinBox()
+        self.weight_pat.setRange(0, 100)
+        self.weight_pat.setValue(15)
+        self.weight_macd = QSpinBox()
+        self.weight_macd.setRange(0, 100)
+        self.weight_macd.setValue(5)
+        self.weight_rsi = QSpinBox()
+        self.weight_rsi.setRange(0, 100)
+        self.weight_rsi.setValue(5)
+        self.btn_reset_weights = QPushButton("重置默认")
+        weight_layout.addWidget(QLabel("量能"))
+        weight_layout.addWidget(self.weight_vol)
+        weight_layout.addWidget(QLabel("均线"))
+        weight_layout.addWidget(self.weight_ma)
+        weight_layout.addWidget(QLabel("突破"))
+        weight_layout.addWidget(self.weight_brk)
+        weight_layout.addWidget(QLabel("形态"))
+        weight_layout.addWidget(self.weight_pat)
+        weight_layout.addWidget(QLabel("MACD"))
+        weight_layout.addWidget(self.weight_macd)
+        weight_layout.addWidget(QLabel("RSI"))
+        weight_layout.addWidget(self.weight_rsi)
+        weight_layout.addWidget(self.btn_reset_weights)
+        weight_group.setLayout(weight_layout)
+        filters_layout.addWidget(weight_group)
+
+        # --- 回测配置 ---
+        bt_group = QGroupBox("回测配置")
+        bt_layout = QHBoxLayout()
+        self.bt_lookback = QSpinBox()
+        self.bt_lookback.setRange(5, 300)
+        self.bt_lookback.setValue(60)
+        self.bt_forward = QSpinBox()
+        self.bt_forward.setRange(1, 60)
+        self.bt_forward.setValue(5)
+        self.bt_fee_bps = QSpinBox()
+        self.bt_fee_bps.setRange(0, 100)
+        self.bt_fee_bps.setValue(3)
+        self.bt_topk = QSpinBox()
+        self.bt_topk.setRange(0, 200)
+        self.bt_topk.setValue(0)
+        self.bt_entry_mode = QComboBox()
+        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])  # close | next_open
+        self.bt_exit_mode = QComboBox()
+        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])  # close | open
+        self.bt_exclude_limit = QCheckBox("排除信号日涨停")
+        self.bt_limit_th = QSpinBox()
+        self.bt_limit_th.setRange(0, 20)
+        self.bt_limit_th.setValue(10)
+        bt_layout.addWidget(QLabel("回看窗口N:"))
+        bt_layout.addWidget(self.bt_lookback)
+        bt_layout.addWidget(QLabel("前瞻天数n:"))
+        bt_layout.addWidget(self.bt_forward)
+        bt_layout.addWidget(QLabel("单边手续费‰:"))
+        bt_layout.addWidget(self.bt_fee_bps)
+        bt_layout.addWidget(QLabel("每日TopK(0不限):"))
+        bt_layout.addWidget(self.bt_topk)
+        bt_layout.addWidget(self.bt_entry_mode)
+        bt_layout.addWidget(self.bt_exit_mode)
+        bt_layout.addWidget(self.bt_exclude_limit)
+        bt_layout.addWidget(QLabel("涨停阈值%:"))
+        bt_layout.addWidget(self.bt_limit_th)
+        bt_group.setLayout(bt_layout)
+        filters_layout.addWidget(bt_group)
+
+        filters_layout.addStretch(1)
+        filters_container.setLayout(filters_layout)
+        scroll = QScrollArea()
+        scroll.setWidget(filters_container)
+        scroll.setWidgetResizable(True)
+        self.left_dock = QDockWidget("筛选条件", self)
+        self.left_dock.setWidget(scroll)
+        self.left_dock.setObjectName("dock_filters")
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+
+        # =============== 中央：结果表格 ===============
+        central = QWidget()
+        central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(8, 8, 8, 8)
+
+        # 顶部快速提示与搜索条（工具栏中提供更合适，这里仅放表格）
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"])
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        central_layout.addWidget(self.table)
+        central.setLayout(central_layout)
         self.setCentralWidget(central)
 
-        # 交互逻辑
-        self.fetch_btn.clicked.connect(self.on_fetch_data)
-        self.select_btn.clicked.connect(self.on_select_stock)
+        # =============== 右侧：详情面板 ===============
+        self.detail_panel = QWidget()
+        dlayout = QVBoxLayout()
+        dlayout.setContentsMargins(8, 8, 8, 8)
+        self.detail_title = QLabel("选中行详情")
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        dlayout.addWidget(self.detail_title)
+        dlayout.addWidget(self.detail_text, 1)
+        self.detail_panel.setLayout(dlayout)
+        self.right_dock = QDockWidget("详情", self)
+        self.right_dock.setObjectName("dock_detail")
+        self.right_dock.setWidget(self.detail_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+
+        # =============== 顶部工具栏 ===============
+        self.init_toolbar()
+
+        # =============== 信号连接 ===============
         self.table.cellDoubleClicked.connect(self.on_plot_kline)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
         self.radio_recent.toggled.connect(self.toggle_date_mode)
         self.radio_custom.toggled.connect(self.toggle_date_mode)
-        self.export_btn.clicked.connect(self.on_export_excel)
-    def on_export_excel(self):
-        import pandas as pd
-        from PyQt5.QtWidgets import QFileDialog
-        row_count = self.table.rowCount()
-        col_count = self.table.columnCount()
-        if row_count == 0:
-            QMessageBox.information(self, "提示", "无可导出的数据！")
-            return
-        data = []
-        headers = [self.table.horizontalHeaderItem(i).text() for i in range(col_count)]
-        for i in range(row_count):
-            row = []
-            for j in range(col_count):
-                item = self.table.item(i, j)
-                row.append(item.text() if item else "")
-            data.append(row)
-        df = pd.DataFrame(data, columns=headers)
-        file_path, _ = QFileDialog.getSaveFileName(self, "保存为Excel", "选股结果.xlsx", "Excel Files (*.xlsx)")
-        if file_path:
-            try:
-                df.to_excel(file_path, index=False)
-                QMessageBox.information(self, "导出成功", f"已导出到: {file_path}")
-            except Exception as e:
-                QMessageBox.warning(self, "导出失败", f"导出Excel失败: {e}")
+        self.btn_reset_weights.clicked.connect(self.on_reset_weights)
 
-    def toggle_date_mode(self):
-        is_recent = self.radio_recent.isChecked()
-        self.spin_recent.setEnabled(is_recent)
-        self.date_start.setEnabled(not is_recent)
-        self.date_end.setEnabled(not is_recent)
+        # 还原窗口布局
+        try:
+            geo = self.settings.value("main/geometry")
+            state = self.settings.value("main/state")
+            if geo:
+                self.restoreGeometry(geo)
+            if state:
+                self.restoreState(state)
+        except Exception:
+            pass
 
-    def get_block_prefix(self):
-        return [cb.text() for cb in self.prefix_checkboxes if cb.isChecked()]
+        # 初始信息
+        self.set_info("准备就绪")
 
-    def get_date_range(self):
-        if self.radio_recent.isChecked():
-            days = self.spin_recent.value()
-            end = QDate.currentDate()
-            start = end.addDays(-days)
+    # 主题样式
+    def apply_theme(self, dark: bool = True):
+        self._dark_theme = dark
+        if dark:
+            qss = """
+            QWidget { background-color: #121212; color: #E0E0E0; }
+            QGroupBox { border: 1px solid #2A2A2A; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #BDBDBD; }
+            QToolBar { background: #1E1E1E; border-bottom: 1px solid #2A2A2A; }
+            QStatusBar { background: #1E1E1E; }
+            QTableWidget { gridline-color: #2A2A2A; }
+            QHeaderView::section { background-color: #1E1E1E; color: #BDBDBD; border: 1px solid #2A2A2A; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #2D2D2D; border: 1px solid #3A3A3A; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #383838; }
+            QDockWidget::title { text-align: left; padding-left: 6px; }
+            QScrollBar:vertical { background: #1A1A1A; width: 10px; }
+            QScrollBar::handle:vertical { background: #3A3A3A; min-height: 30px; border-radius: 4px; }
+            """
         else:
-            start = self.date_start.date()
-            end = self.date_end.date()
-        return start.toString("yyyyMMdd"), end.toString("yyyyMMdd")
+            qss = """
+            QWidget { background-color: #FAFAFA; color: #212121; }
+            QGroupBox { border: 1px solid #DDDDDD; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #616161; }
+            QToolBar { background: #F5F5F5; border-bottom: 1px solid #E0E0E0; }
+            QStatusBar { background: #F5F5F5; }
+            QHeaderView::section { background-color: #F5F5F5; color: #616161; border: 1px solid #E0E0E0; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #FAFAFA; }
+            """
+        self.setStyleSheet(qss)
 
-    def on_fetch_data(self):
-        stock_df = self.fetcher.fetch_stock_list()
-        self.table.setRowCount(len(stock_df))
-        for i, row in stock_df.iterrows():
-            ts_code = str(row['ts_code'])
-            name = str(row.get('name', ''))
-            industry = str(row.get('industry', ''))
-            # 查询最新收盘价
-            close_row = self.db.conn.execute(
-                "SELECT close FROM daily_kline WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (ts_code,)).fetchone()
-            close = f"{close_row[0]:.2f}" if close_row and close_row[0] is not None else "-"
-            self.table.setItem(i, 0, QTableWidgetItem(ts_code))
-            self.table.setItem(i, 1, QTableWidgetItem(name))
-            self.table.setItem(i, 2, QTableWidgetItem(industry))
-            self.table.setItem(i, 3, QTableWidgetItem(close))
-            self.table.setItem(i, 4, QTableWidgetItem("-"))
-        self.info_label.setText(f"已加载股票数：{len(stock_df)}")
+    def init_toolbar(self):
+        tb = QToolBar("主工具栏", self)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(Qt.TopToolBarArea, tb)
 
-    def on_select_stock(self):
-        # 读取筛选条件
-        block_prefix = self.get_block_prefix()
-        start, end = self.get_date_range()
-        pct = float(self.pct_input.text().strip() or 0)
-        single_pct = float(self.single_pct_input.text().strip() or 0)
-        # 查询并筛选
-        stock_df = self.fetcher.fetch_stock_list()
-        if block_prefix:
-            stock_df = stock_df[~stock_df['ts_code'].str.startswith(tuple(block_prefix))]
-        result = []
-        for _, row in stock_df.iterrows():
-            ts_code = row['ts_code']
-            name = row.get('name', '')
-            industry = row.get('industry', '')
-            kline = self.db.conn.execute(
-                "SELECT close, pct_chg FROM daily_kline WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date ASC", 
-                (ts_code, start, end)).fetchall()
-            if len(kline) < 2:
-                continue
-            closes = [x[0] for x in kline]
-            pct_chg = (closes[-1] - closes[0]) / closes[0] * 100
-            single_day_pcts = [x[1] for x in kline if x[1] is not None]
-            has_single = any(p is not None and p >= single_pct for p in single_day_pcts) if single_pct > 0 else True
-            max_up = max(single_day_pcts) if single_day_pcts else 0
-            max_down = min(single_day_pcts) if single_day_pcts else 0
-            if pct_chg >= pct and has_single:
-                close = closes[-1]
-                result.append((ts_code, name, industry, close, pct_chg, max_up, max_down))
-        self.table.setRowCount(len(result))
-        for i, (ts_code, name, industry, close, pct_chg, max_up, max_down) in enumerate(result):
-            self.table.setItem(i, 0, QTableWidgetItem(ts_code))
-            self.table.setItem(i, 1, QTableWidgetItem(name))
-            self.table.setItem(i, 2, QTableWidgetItem(industry))
-            self.table.setItem(i, 3, QTableWidgetItem(f"{close:.2f}"))
-            self.table.setItem(i, 4, QTableWidgetItem(f"{pct_chg:.2f}%"))
-            self.table.setItem(i, 5, QTableWidgetItem(f"{max_up:.2f}%"))
-            self.table.setItem(i, 6, QTableWidgetItem(f"{max_down:.2f}%"))
+        # 标准图标
+        st = self.style()
+        icon_refresh = st.standardIcon(QStyle.SP_BrowserReload)
+        icon_run = st.standardIcon(QStyle.SP_MediaPlay)
+        icon_export = st.standardIcon(QStyle.SP_DialogSaveButton)
+        icon_info = st.standardIcon(QStyle.SP_MessageBoxInformation)
+        icon_theme = st.standardIcon(QStyle.SP_DialogHelpButton)
 
-    def on_plot_kline(self, row, col):
-        ts_code = self.table.item(row, 0).text()
-        # 获取当前筛选的日期区间
-        start, end = self.get_date_range()
-        kline = self.db.conn.execute(
-            "SELECT trade_date, open, high, low, close, vol FROM daily_kline WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date ASC", 
-            (ts_code, start, end)).fetchall()
-        if not kline:
-            QMessageBox.warning(self, "无数据", "该股票区间无K线数据")
-            return
-        # 保证弹窗对象持有，防止被垃圾回收
-        if not hasattr(self, '_plot_windows'):
-            self._plot_windows = []
-        win = PlotWindow(ts_code, kline)
-        self._plot_windows.append(win)
-        win.show()
+        act_fetch = QAction(icon_refresh, "获取全部股票", self)
+        act_fetch.triggered.connect(self.on_fetch_data)
+        act_fetch.setShortcut("Ctrl+R")
+        tb.addAction(act_fetch)
+
+        act_select = QAction(icon_run, "执行选股", self)
+        act_select.triggered.connect(self.on_select_stock)
+        act_select.setShortcut("F5")
+        tb.addAction(act_select)
+
+        act_export = QAction(icon_export, "导出选股结果", self)
+        act_export.triggered.connect(self.on_export_excel)
+        act_export.setShortcut("Ctrl+E")
+        tb.addAction(act_export)
+
+        tb.addSeparator()
+
+        act_detail = QAction(icon_info, "查看详情", self)
+        act_detail.triggered.connect(self.on_view_detail)
+        act_detail.setShortcut("Enter")
+        tb.addAction(act_detail)
+
+        tb.addSeparator()
+
+        act_bt_run = QAction(icon_run, "运行回测", self)
+        act_bt_run.triggered.connect(self.on_run_backtest)
+        act_bt_run.setShortcut("Ctrl+B")
+        tb.addAction(act_bt_run)
+
+        act_bt_export = QAction(icon_export, "导出回测明细", self)
+        act_bt_export.triggered.connect(self.on_export_backtest)
+        act_bt_export.setShortcut("Ctrl+Shift+E")
+        tb.addAction(act_bt_export)
+
+        tb.addSeparator()
+
+        # 重置评分权重
+        act_reset_weights = QAction("重置权重", self)
+        act_reset_weights.triggered.connect(self.on_reset_weights)
+        tb.addAction(act_reset_weights)
+
+        # 主题切换
+        act_theme = QAction(icon_theme, "切换主题", self)
+        def _toggle_theme():
+            self.apply_theme(dark=not self._dark_theme)
+        act_theme.triggered.connect(_toggle_theme)
+        act_theme.setShortcut("Ctrl+T")
+        tb.addAction(act_theme)
+
+        # 搜索框
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索代码/名称  回车筛选/清空恢复")
+        self.search_edit.returnPressed.connect(self.apply_table_search)
+        wa = QWidgetAction(self)
+        wa.setDefaultWidget(self.search_edit)
+        tb.addAction(wa)
+
+    def init_ui(self):
+        # 主题与状态栏和 Dock 等已在上一段定义，这里继续原实现
+        self.apply_theme(dark=True)
+        self.setStatusBar(QStatusBar(self))
+        self.info_label = QLabel("欢迎使用A股选股分析工具")
+        self.statusBar().addPermanentWidget(self.info_label, 1)
+
+        # =============== 左侧：筛选器（放入可滚动 Dock） ===============
+        filters_container = QWidget()
+        filters_layout = QVBoxLayout()
+        filters_layout.setContentsMargins(8, 8, 8, 8)
+        filters_layout.setSpacing(8)
+
+        # --- 屏蔽前缀 ---
+        block_group = QGroupBox("屏蔽股票前缀")
+        block_layout = QHBoxLayout()
+        self.prefix_checkboxes = []
+        for prefix in ["30", "68", "4", "8"]:
+            cb = QCheckBox(prefix)
+            cb.setChecked(True)
+            self.prefix_checkboxes.append(cb)
+            block_layout.addWidget(cb)
+        block_group.setLayout(block_layout)
+        filters_layout.addWidget(block_group)
+
+        # --- 日期区间 ---
+        date_group = QGroupBox("日期区间")
+        date_layout = QHBoxLayout()
+        self.radio_recent = QRadioButton("最近N天")
+        self.radio_recent.setChecked(True)
+        self.spin_recent = QSpinBox()
+        self.spin_recent.setRange(1, 365)
+        self.spin_recent.setValue(20)
+        self.radio_custom = QRadioButton("自定义区间")
+        self.date_start = QDateEdit(QDate.currentDate().addDays(-20))
+        self.date_end = QDateEdit(QDate.currentDate())
+        self.date_start.setEnabled(False)
+        self.date_end.setEnabled(False)
+        date_layout.addWidget(self.radio_recent)
+        date_layout.addWidget(self.spin_recent)
+        date_layout.addWidget(self.radio_custom)
+        date_layout.addWidget(QLabel("起始:"))
+        date_layout.addWidget(self.date_start)
+        date_layout.addWidget(QLabel("结束:"))
+        date_layout.addWidget(self.date_end)
+        date_group.setLayout(date_layout)
+        filters_layout.addWidget(date_group)
+
+        # --- 涨幅筛选 ---
+        filter_group = QGroupBox("涨幅筛选")
+        filter_layout = QHBoxLayout()
+        self.pct_input = QLineEdit()
+        self.pct_input.setPlaceholderText("区间累计涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("区间累计涨幅大于:"))
+        filter_layout.addWidget(self.pct_input)
+        self.single_pct_input = QLineEdit()
+        self.single_pct_input.setPlaceholderText("单日涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("单日涨幅大于:"))
+        filter_layout.addWidget(self.single_pct_input)
+        self.single_days_spin = QSpinBox()
+        self.single_days_spin.setRange(1, 365)
+        self.single_days_spin.setValue(20)
+        filter_layout.addWidget(QLabel("在最近N天内:"))
+        filter_layout.addWidget(self.single_days_spin)
+        filter_group.setLayout(filter_layout)
+        filters_layout.addWidget(filter_group)
+
+        # --- 成交量策略 ---
+        vol_group = QGroupBox("成交量")
+        vol_layout = QHBoxLayout()
+        self.volume_mode = QComboBox()
+        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])  # None | volume_breakout | volume_pullback
+        self.volume_ma_days = QSpinBox()
+        self.volume_ma_days.setRange(1, 60)
+        self.volume_ma_days.setValue(5)
+        self.volume_ratio_min = QLineEdit()
+        self.volume_ratio_min.setPlaceholderText("放量阈值，如1.5")
+        self.volume_ratio_max = QLineEdit()
+        self.volume_ratio_max.setPlaceholderText("缩量阈值，如0.7")
+        self.cb_pullback_red = QCheckBox("回调需收阴")
+        self.touch_ma_spin = QSpinBox()
+        self.touch_ma_spin.setRange(0, 250)
+        self.touch_ma_spin.setValue(0)
+        vol_layout.addWidget(QLabel("模式:"))
+        vol_layout.addWidget(self.volume_mode)
+        vol_layout.addWidget(QLabel("量均线N:"))
+        vol_layout.addWidget(self.volume_ma_days)
+        vol_layout.addWidget(QLabel("放量≥:"))
+        vol_layout.addWidget(self.volume_ratio_min)
+        vol_layout.addWidget(QLabel("缩量≤:"))
+        vol_layout.addWidget(self.volume_ratio_max)
+        vol_layout.addWidget(self.cb_pullback_red)
+        vol_layout.addWidget(QLabel("回踩MA(N=0关闭):"))
+        vol_layout.addWidget(self.touch_ma_spin)
+        vol_group.setLayout(vol_layout)
+        filters_layout.addWidget(vol_group)
+
+        # --- 均线系统 ---
+        ma_group = QGroupBox("均线系统")
+        ma_layout = QHBoxLayout()
+        self.ma_days_input = QLineEdit("5,10,20")
+        self.ma_align_combo = QComboBox()
+        self.ma_align_combo.addItems(["无", "多头", "空头"])  # None | long | short
+        self.price_above_ma_spin = QSpinBox()
+        self.price_above_ma_spin.setRange(0, 250)
+        self.price_above_ma_spin.setValue(0)
+        ma_layout.addWidget(QLabel("MA天数(逗号):"))
+        ma_layout.addWidget(self.ma_days_input)
+        ma_layout.addWidget(QLabel("排列:"))
+        ma_layout.addWidget(self.ma_align_combo)
+        ma_layout.addWidget(QLabel("价格在N日MA之上(0为关闭):"))
+        ma_layout.addWidget(self.price_above_ma_spin)
+        ma_group.setLayout(ma_layout)
+        filters_layout.addWidget(ma_group)
+
+        # --- 热度 ---
+        heat_group = QGroupBox("热度(新闻条数)")
+        heat_layout = QHBoxLayout()
+        self.heat_min_news = QSpinBox()
+        self.heat_min_news.setRange(0, 100000)
+        self.heat_min_news.setValue(0)
+        self.heat_window = QSpinBox()
+        self.heat_window.setRange(1, 60)
+        self.heat_window.setValue(5)
+        heat_layout.addWidget(QLabel("最小新闻数:"))
+        heat_layout.addWidget(self.heat_min_news)
+        heat_layout.addWidget(QLabel("统计窗口N:"))
+        heat_layout.addWidget(self.heat_window)
+        heat_group.setLayout(heat_layout)
+        filters_layout.addWidget(heat_group)
+
+        # --- 技术条件 ---
+        tech_group = QGroupBox("技术条件")
+        tech_layout = QHBoxLayout()
+        self.breakout_n_spin = QSpinBox()
+        self.breakout_n_spin.setRange(0, 250)
+        self.breakout_n_spin.setValue(0)
+        self.breakout_min_pct = QLineEdit()
+        self.breakout_min_pct.setPlaceholderText("突破最小幅度% 可空")
+        self.atr_period_spin = QSpinBox()
+        self.atr_period_spin.setRange(0, 250)
+        self.atr_period_spin.setValue(0)
+        self.atr_max_pct = QLineEdit()
+        self.atr_max_pct.setPlaceholderText("ATR/价 ≤ % 可空")
+        self.cb_macd = QCheckBox("MACD")
+        self.macd_rule = QComboBox()
+        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
+        self.cb_rsi = QCheckBox("RSI")
+        self.rsi_period_spin = QSpinBox()
+        self.rsi_period_spin.setRange(1, 250)
+        self.rsi_period_spin.setValue(14)
+        self.rsi_min = QLineEdit()
+        self.rsi_min.setPlaceholderText("RSI≥ 可空")
+        self.rsi_max = QLineEdit()
+        self.rsi_max.setPlaceholderText("RSI≤ 可空")
+        tech_layout.addWidget(QLabel("N日新高N:"))
+        tech_layout.addWidget(self.breakout_n_spin)
+        tech_layout.addWidget(QLabel("最小突破%:"))
+        tech_layout.addWidget(self.breakout_min_pct)
+        tech_layout.addWidget(QLabel("ATR周期:"))
+        tech_layout.addWidget(self.atr_period_spin)
+        tech_layout.addWidget(QLabel("ATR/价≤%:"))
+        tech_layout.addWidget(self.atr_max_pct)
+        tech_layout.addWidget(self.cb_macd)
+        tech_layout.addWidget(self.macd_rule)
+        tech_layout.addWidget(self.cb_rsi)
+        tech_layout.addWidget(self.rsi_period_spin)
+        tech_layout.addWidget(self.rsi_min)
+        tech_layout.addWidget(self.rsi_max)
+        tech_group.setLayout(tech_layout)
+        filters_layout.addWidget(tech_group)
+
+        # --- 板块 ---
+        board_group = QGroupBox("板块")
+        board_layout = QHBoxLayout()
+        self.board_in_input = QLineEdit()
+        self.board_in_input.setPlaceholderText("包含板块代码/名称，逗号分隔")
+        self.board_out_input = QLineEdit()
+        self.board_out_input.setPlaceholderText("排除板块代码/名称，逗号分隔")
+        board_layout.addWidget(QLabel("包含:"))
+        board_layout.addWidget(self.board_in_input)
+        board_layout.addWidget(QLabel("排除:"))
+        board_layout.addWidget(self.board_out_input)
+        board_group.setLayout(board_layout)
+        filters_layout.addWidget(board_group)
+
+        # --- 形态 ---
+        pattern_group = QGroupBox("K线形态")
+        pattern_layout = QHBoxLayout()
+        self.cb_engulf = QCheckBox("吞没")
+        self.cb_hammer = QCheckBox("锤子线")
+        self.cb_shoot = QCheckBox("射击之星")
+        self.cb_doji = QCheckBox("十字星")
+        self.pattern_window_spin = QSpinBox()
+        self.pattern_window_spin.setRange(1, 60)
+        self.pattern_window_spin.setValue(5)
+        pattern_layout.addWidget(self.cb_engulf)
+        pattern_layout.addWidget(self.cb_hammer)
+        pattern_layout.addWidget(self.cb_shoot)
+        pattern_layout.addWidget(self.cb_doji)
+        pattern_layout.addWidget(QLabel("检测最近N根:"))
+        pattern_layout.addWidget(self.pattern_window_spin)
+        pattern_group.setLayout(pattern_layout)
+        filters_layout.addWidget(pattern_group)
+
+        # --- 评分权重 ---
+        weight_group = QGroupBox("评分权重（仅对启用项计分，自动归一化到100）")
+        weight_layout = QHBoxLayout()
+        self.weight_vol = QSpinBox()
+        self.weight_vol.setRange(0, 100)
+        self.weight_vol.setValue(30)
+        self.weight_ma = QSpinBox()
+        self.weight_ma.setRange(0, 100)
+        self.weight_ma.setValue(20)
+        self.weight_brk = QSpinBox()
+        self.weight_brk.setRange(0, 100)
+        self.weight_brk.setValue(25)
+        self.weight_pat = QSpinBox()
+        self.weight_pat.setRange(0, 100)
+        self.weight_pat.setValue(15)
+        self.weight_macd = QSpinBox()
+        self.weight_macd.setRange(0, 100)
+        self.weight_macd.setValue(5)
+        self.weight_rsi = QSpinBox()
+        self.weight_rsi.setRange(0, 100)
+        self.weight_rsi.setValue(5)
+        self.btn_reset_weights = QPushButton("重置默认")
+        weight_layout.addWidget(QLabel("量能"))
+        weight_layout.addWidget(self.weight_vol)
+        weight_layout.addWidget(QLabel("均线"))
+        weight_layout.addWidget(self.weight_ma)
+        weight_layout.addWidget(QLabel("突破"))
+        weight_layout.addWidget(self.weight_brk)
+        weight_layout.addWidget(QLabel("形态"))
+        weight_layout.addWidget(self.weight_pat)
+        weight_layout.addWidget(QLabel("MACD"))
+        weight_layout.addWidget(self.weight_macd)
+        weight_layout.addWidget(QLabel("RSI"))
+        weight_layout.addWidget(self.weight_rsi)
+        weight_layout.addWidget(self.btn_reset_weights)
+        weight_group.setLayout(weight_layout)
+        filters_layout.addWidget(weight_group)
+
+        # --- 回测配置 ---
+        bt_group = QGroupBox("回测配置")
+        bt_layout = QHBoxLayout()
+        self.bt_lookback = QSpinBox()
+        self.bt_lookback.setRange(5, 300)
+        self.bt_lookback.setValue(60)
+        self.bt_forward = QSpinBox()
+        self.bt_forward.setRange(1, 60)
+        self.bt_forward.setValue(5)
+        self.bt_fee_bps = QSpinBox()
+        self.bt_fee_bps.setRange(0, 100)
+        self.bt_fee_bps.setValue(3)
+        self.bt_topk = QSpinBox()
+        self.bt_topk.setRange(0, 200)
+        self.bt_topk.setValue(0)
+        self.bt_entry_mode = QComboBox()
+        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])  # close | next_open
+        self.bt_exit_mode = QComboBox()
+        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])  # close | open
+        self.bt_exclude_limit = QCheckBox("排除信号日涨停")
+        self.bt_limit_th = QSpinBox()
+        self.bt_limit_th.setRange(0, 20)
+        self.bt_limit_th.setValue(10)
+        bt_layout.addWidget(QLabel("回看窗口N:"))
+        bt_layout.addWidget(self.bt_lookback)
+        bt_layout.addWidget(QLabel("前瞻天数n:"))
+        bt_layout.addWidget(self.bt_forward)
+        bt_layout.addWidget(QLabel("单边手续费‰:"))
+        bt_layout.addWidget(self.bt_fee_bps)
+        bt_layout.addWidget(QLabel("每日TopK(0不限):"))
+        bt_layout.addWidget(self.bt_topk)
+        bt_layout.addWidget(self.bt_entry_mode)
+        bt_layout.addWidget(self.bt_exit_mode)
+        bt_layout.addWidget(self.bt_exclude_limit)
+        bt_layout.addWidget(QLabel("涨停阈值%:"))
+        bt_layout.addWidget(self.bt_limit_th)
+        bt_group.setLayout(bt_layout)
+        filters_layout.addWidget(bt_group)
+
+        filters_layout.addStretch(1)
+        filters_container.setLayout(filters_layout)
+        scroll = QScrollArea()
+        scroll.setWidget(filters_container)
+        scroll.setWidgetResizable(True)
+        self.left_dock = QDockWidget("筛选条件", self)
+        self.left_dock.setWidget(scroll)
+        self.left_dock.setObjectName("dock_filters")
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+
+        # =============== 中央：结果表格 ===============
+        central = QWidget()
+        central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(8, 8, 8, 8)
+
+        # 顶部快速提示与搜索条（工具栏中提供更合适，这里仅放表格）
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"])
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        central_layout.addWidget(self.table)
+        central.setLayout(central_layout)
+        self.setCentralWidget(central)
+
+        # =============== 右侧：详情面板 ===============
+        self.detail_panel = QWidget()
+        dlayout = QVBoxLayout()
+        dlayout.setContentsMargins(8, 8, 8, 8)
+        self.detail_title = QLabel("选中行详情")
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        dlayout.addWidget(self.detail_title)
+        dlayout.addWidget(self.detail_text, 1)
+        self.detail_panel.setLayout(dlayout)
+        self.right_dock = QDockWidget("详情", self)
+        self.right_dock.setObjectName("dock_detail")
+        self.right_dock.setWidget(self.detail_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+
+        # =============== 顶部工具栏 ===============
+        self.init_toolbar()
+
+        # =============== 信号连接 ===============
+        self.table.cellDoubleClicked.connect(self.on_plot_kline)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.radio_recent.toggled.connect(self.toggle_date_mode)
+        self.radio_custom.toggled.connect(self.toggle_date_mode)
+        self.btn_reset_weights.clicked.connect(self.on_reset_weights)
+
+        # 还原窗口布局
+        try:
+            geo = self.settings.value("main/geometry")
+            state = self.settings.value("main/state")
+            if geo:
+                self.restoreGeometry(geo)
+            if state:
+                self.restoreState(state)
+        except Exception:
+            pass
+
+        # 初始信息
+        self.set_info("准备就绪")
+
+    # 主题样式
+    def apply_theme(self, dark: bool = True):
+        self._dark_theme = dark
+        if dark:
+            qss = """
+            QWidget { background-color: #121212; color: #E0E0E0; }
+            QGroupBox { border: 1px solid #2A2A2A; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #BDBDBD; }
+            QToolBar { background: #1E1E1E; border-bottom: 1px solid #2A2A2A; }
+            QStatusBar { background: #1E1E1E; }
+            QTableWidget { gridline-color: #2A2A2A; }
+            QHeaderView::section { background-color: #1E1E1E; color: #BDBDBD; border: 1px solid #2A2A2A; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #2D2D2D; border: 1px solid #3A3A3A; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #383838; }
+            QDockWidget::title { text-align: left; padding-left: 6px; }
+            QScrollBar:vertical { background: #1A1A1A; width: 10px; }
+            QScrollBar::handle:vertical { background: #3A3A3A; min-height: 30px; border-radius: 4px; }
+            """
+        else:
+            qss = """
+            QWidget { background-color: #FAFAFA; color: #212121; }
+            QGroupBox { border: 1px solid #DDDDDD; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #616161; }
+            QToolBar { background: #F5F5F5; border-bottom: 1px solid #E0E0E0; }
+            QStatusBar { background: #F5F5F5; }
+            QHeaderView::section { background-color: #F5F5F5; color: #616161; border: 1px solid #E0E0E0; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #FAFAFA; }
+            """
+        self.setStyleSheet(qss)
+
+    def init_toolbar(self):
+        tb = QToolBar("主工具栏", self)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(Qt.TopToolBarArea, tb)
+
+        # 标准图标
+        st = self.style()
+        icon_refresh = st.standardIcon(QStyle.SP_BrowserReload)
+        icon_run = st.standardIcon(QStyle.SP_MediaPlay)
+        icon_export = st.standardIcon(QStyle.SP_DialogSaveButton)
+        icon_info = st.standardIcon(QStyle.SP_MessageBoxInformation)
+        icon_theme = st.standardIcon(QStyle.SP_DialogHelpButton)
+
+        act_fetch = QAction(icon_refresh, "获取全部股票", self)
+        act_fetch.triggered.connect(self.on_fetch_data)
+        act_fetch.setShortcut("Ctrl+R")
+        tb.addAction(act_fetch)
+
+        act_select = QAction(icon_run, "执行选股", self)
+        act_select.triggered.connect(self.on_select_stock)
+        act_select.setShortcut("F5")
+        tb.addAction(act_select)
+
+        act_export = QAction(icon_export, "导出选股结果", self)
+        act_export.triggered.connect(self.on_export_excel)
+        act_export.setShortcut("Ctrl+E")
+        tb.addAction(act_export)
+
+        tb.addSeparator()
+
+        act_detail = QAction(icon_info, "查看详情", self)
+        act_detail.triggered.connect(self.on_view_detail)
+        act_detail.setShortcut("Enter")
+        tb.addAction(act_detail)
+
+        tb.addSeparator()
+
+        act_bt_run = QAction(icon_run, "运行回测", self)
+        act_bt_run.triggered.connect(self.on_run_backtest)
+        act_bt_run.setShortcut("Ctrl+B")
+        tb.addAction(act_bt_run)
+
+        act_bt_export = QAction(icon_export, "导出回测明细", self)
+        act_bt_export.triggered.connect(self.on_export_backtest)
+        act_bt_export.setShortcut("Ctrl+Shift+E")
+        tb.addAction(act_bt_export)
+
+        tb.addSeparator()
+
+        # 重置评分权重
+        act_reset_weights = QAction("重置权重", self)
+        act_reset_weights.triggered.connect(self.on_reset_weights)
+        tb.addAction(act_reset_weights)
+
+        # 主题切换
+        act_theme = QAction(icon_theme, "切换主题", self)
+        def _toggle_theme():
+            self.apply_theme(dark=not self._dark_theme)
+        act_theme.triggered.connect(_toggle_theme)
+        act_theme.setShortcut("Ctrl+T")
+        tb.addAction(act_theme)
+
+        # 搜索框
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索代码/名称  回车筛选/清空恢复")
+        self.search_edit.returnPressed.connect(self.apply_table_search)
+        wa = QWidgetAction(self)
+        wa.setDefaultWidget(self.search_edit)
+        tb.addAction(wa)
+
+    def init_ui(self):
+        # 主题与状态栏和 Dock 等已在上一段定义，这里继续原实现
+        self.apply_theme(dark=True)
+        self.setStatusBar(QStatusBar(self))
+        self.info_label = QLabel("欢迎使用A股选股分析工具")
+        self.statusBar().addPermanentWidget(self.info_label, 1)
+
+        # =============== 左侧：筛选器（放入可滚动 Dock） ===============
+        filters_container = QWidget()
+        filters_layout = QVBoxLayout()
+        filters_layout.setContentsMargins(8, 8, 8, 8)
+        filters_layout.setSpacing(8)
+
+        # --- 屏蔽前缀 ---
+        block_group = QGroupBox("屏蔽股票前缀")
+        block_layout = QHBoxLayout()
+        self.prefix_checkboxes = []
+        for prefix in ["30", "68", "4", "8"]:
+            cb = QCheckBox(prefix)
+            cb.setChecked(True)
+            self.prefix_checkboxes.append(cb)
+            block_layout.addWidget(cb)
+        block_group.setLayout(block_layout)
+        filters_layout.addWidget(block_group)
+
+        # --- 日期区间 ---
+        date_group = QGroupBox("日期区间")
+        date_layout = QHBoxLayout()
+        self.radio_recent = QRadioButton("最近N天")
+        self.radio_recent.setChecked(True)
+        self.spin_recent = QSpinBox()
+        self.spin_recent.setRange(1, 365)
+        self.spin_recent.setValue(20)
+        self.radio_custom = QRadioButton("自定义区间")
+        self.date_start = QDateEdit(QDate.currentDate().addDays(-20))
+        self.date_end = QDateEdit(QDate.currentDate())
+        self.date_start.setEnabled(False)
+        self.date_end.setEnabled(False)
+        date_layout.addWidget(self.radio_recent)
+        date_layout.addWidget(self.spin_recent)
+        date_layout.addWidget(self.radio_custom)
+        date_layout.addWidget(QLabel("起始:"))
+        date_layout.addWidget(self.date_start)
+        date_layout.addWidget(QLabel("结束:"))
+        date_layout.addWidget(self.date_end)
+        date_group.setLayout(date_layout)
+        filters_layout.addWidget(date_group)
+
+        # --- 涨幅筛选 ---
+        filter_group = QGroupBox("涨幅筛选")
+        filter_layout = QHBoxLayout()
+        self.pct_input = QLineEdit()
+        self.pct_input.setPlaceholderText("区间累计涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("区间累计涨幅大于:"))
+        filter_layout.addWidget(self.pct_input)
+        self.single_pct_input = QLineEdit()
+        self.single_pct_input.setPlaceholderText("单日涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("单日涨幅大于:"))
+        filter_layout.addWidget(self.single_pct_input)
+        self.single_days_spin = QSpinBox()
+        self.single_days_spin.setRange(1, 365)
+        self.single_days_spin.setValue(20)
+        filter_layout.addWidget(QLabel("在最近N天内:"))
+        filter_layout.addWidget(self.single_days_spin)
+        filter_group.setLayout(filter_layout)
+        filters_layout.addWidget(filter_group)
+
+        # --- 成交量策略 ---
+        vol_group = QGroupBox("成交量")
+        vol_layout = QHBoxLayout()
+        self.volume_mode = QComboBox()
+        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])  # None | volume_breakout | volume_pullback
+        self.volume_ma_days = QSpinBox()
+        self.volume_ma_days.setRange(1, 60)
+        self.volume_ma_days.setValue(5)
+        self.volume_ratio_min = QLineEdit()
+        self.volume_ratio_min.setPlaceholderText("放量阈值，如1.5")
+        self.volume_ratio_max = QLineEdit()
+        self.volume_ratio_max.setPlaceholderText("缩量阈值，如0.7")
+        self.cb_pullback_red = QCheckBox("回调需收阴")
+        self.touch_ma_spin = QSpinBox()
+        self.touch_ma_spin.setRange(0, 250)
+        self.touch_ma_spin.setValue(0)
+        vol_layout.addWidget(QLabel("模式:"))
+        vol_layout.addWidget(self.volume_mode)
+        vol_layout.addWidget(QLabel("量均线N:"))
+        vol_layout.addWidget(self.volume_ma_days)
+        vol_layout.addWidget(QLabel("放量≥:"))
+        vol_layout.addWidget(self.volume_ratio_min)
+        vol_layout.addWidget(QLabel("缩量≤:"))
+        vol_layout.addWidget(self.volume_ratio_max)
+        vol_layout.addWidget(self.cb_pullback_red)
+        vol_layout.addWidget(QLabel("回踩MA(N=0关闭):"))
+        vol_layout.addWidget(self.touch_ma_spin)
+        vol_group.setLayout(vol_layout)
+        filters_layout.addWidget(vol_group)
+
+        # --- 均线系统 ---
+        ma_group = QGroupBox("均线系统")
+        ma_layout = QHBoxLayout()
+        self.ma_days_input = QLineEdit("5,10,20")
+        self.ma_align_combo = QComboBox()
+        self.ma_align_combo.addItems(["无", "多头", "空头"])  # None | long | short
+        self.price_above_ma_spin = QSpinBox()
+        self.price_above_ma_spin.setRange(0, 250)
+        self.price_above_ma_spin.setValue(0)
+        ma_layout.addWidget(QLabel("MA天数(逗号):"))
+        ma_layout.addWidget(self.ma_days_input)
+        ma_layout.addWidget(QLabel("排列:"))
+        ma_layout.addWidget(self.ma_align_combo)
+        ma_layout.addWidget(QLabel("价格在N日MA之上(0为关闭):"))
+        ma_layout.addWidget(self.price_above_ma_spin)
+        ma_group.setLayout(ma_layout)
+        filters_layout.addWidget(ma_group)
+
+        # --- 热度 ---
+        heat_group = QGroupBox("热度(新闻条数)")
+        heat_layout = QHBoxLayout()
+        self.heat_min_news = QSpinBox()
+        self.heat_min_news.setRange(0, 100000)
+        self.heat_min_news.setValue(0)
+        self.heat_window = QSpinBox()
+        self.heat_window.setRange(1, 60)
+        self.heat_window.setValue(5)
+        heat_layout.addWidget(QLabel("最小新闻数:"))
+        heat_layout.addWidget(self.heat_min_news)
+        heat_layout.addWidget(QLabel("统计窗口N:"))
+        heat_layout.addWidget(self.heat_window)
+        heat_group.setLayout(heat_layout)
+        filters_layout.addWidget(heat_group)
+
+        # --- 技术条件 ---
+        tech_group = QGroupBox("技术条件")
+        tech_layout = QHBoxLayout()
+        self.breakout_n_spin = QSpinBox()
+        self.breakout_n_spin.setRange(0, 250)
+        self.breakout_n_spin.setValue(0)
+        self.breakout_min_pct = QLineEdit()
+        self.breakout_min_pct.setPlaceholderText("突破最小幅度% 可空")
+        self.atr_period_spin = QSpinBox()
+        self.atr_period_spin.setRange(0, 250)
+        self.atr_period_spin.setValue(0)
+        self.atr_max_pct = QLineEdit()
+        self.atr_max_pct.setPlaceholderText("ATR/价 ≤ % 可空")
+        self.cb_macd = QCheckBox("MACD")
+        self.macd_rule = QComboBox()
+        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
+        self.cb_rsi = QCheckBox("RSI")
+        self.rsi_period_spin = QSpinBox()
+        self.rsi_period_spin.setRange(1, 250)
+        self.rsi_period_spin.setValue(14)
+        self.rsi_min = QLineEdit()
+        self.rsi_min.setPlaceholderText("RSI≥ 可空")
+        self.rsi_max = QLineEdit()
+        self.rsi_max.setPlaceholderText("RSI≤ 可空")
+        tech_layout.addWidget(QLabel("N日新高N:"))
+        tech_layout.addWidget(self.breakout_n_spin)
+        tech_layout.addWidget(QLabel("最小突破%:"))
+        tech_layout.addWidget(self.breakout_min_pct)
+        tech_layout.addWidget(QLabel("ATR周期:"))
+        tech_layout.addWidget(self.atr_period_spin)
+        tech_layout.addWidget(QLabel("ATR/价≤%:"))
+        tech_layout.addWidget(self.atr_max_pct)
+        tech_layout.addWidget(self.cb_macd)
+        tech_layout.addWidget(self.macd_rule)
+        tech_layout.addWidget(self.cb_rsi)
+        tech_layout.addWidget(self.rsi_period_spin)
+        tech_layout.addWidget(self.rsi_min)
+        tech_layout.addWidget(self.rsi_max)
+        tech_group.setLayout(tech_layout)
+        filters_layout.addWidget(tech_group)
+
+        # --- 板块 ---
+        board_group = QGroupBox("板块")
+        board_layout = QHBoxLayout()
+        self.board_in_input = QLineEdit()
+        self.board_in_input.setPlaceholderText("包含板块代码/名称，逗号分隔")
+        self.board_out_input = QLineEdit()
+        self.board_out_input.setPlaceholderText("排除板块代码/名称，逗号分隔")
+        board_layout.addWidget(QLabel("包含:"))
+        board_layout.addWidget(self.board_in_input)
+        board_layout.addWidget(QLabel("排除:"))
+        board_layout.addWidget(self.board_out_input)
+        board_group.setLayout(board_layout)
+        filters_layout.addWidget(board_group)
+
+        # --- 形态 ---
+        pattern_group = QGroupBox("K线形态")
+        pattern_layout = QHBoxLayout()
+        self.cb_engulf = QCheckBox("吞没")
+        self.cb_hammer = QCheckBox("锤子线")
+        self.cb_shoot = QCheckBox("射击之星")
+        self.cb_doji = QCheckBox("十字星")
+        self.pattern_window_spin = QSpinBox()
+        self.pattern_window_spin.setRange(1, 60)
+        self.pattern_window_spin.setValue(5)
+        pattern_layout.addWidget(self.cb_engulf)
+        pattern_layout.addWidget(self.cb_hammer)
+        pattern_layout.addWidget(self.cb_shoot)
+        pattern_layout.addWidget(self.cb_doji)
+        pattern_layout.addWidget(QLabel("检测最近N根:"))
+        pattern_layout.addWidget(self.pattern_window_spin)
+        pattern_group.setLayout(pattern_layout)
+        filters_layout.addWidget(pattern_group)
+
+        # --- 评分权重 ---
+        weight_group = QGroupBox("评分权重（仅对启用项计分，自动归一化到100）")
+        weight_layout = QHBoxLayout()
+        self.weight_vol = QSpinBox()
+        self.weight_vol.setRange(0, 100)
+        self.weight_vol.setValue(30)
+        self.weight_ma = QSpinBox()
+        self.weight_ma.setRange(0, 100)
+        self.weight_ma.setValue(20)
+        self.weight_brk = QSpinBox()
+        self.weight_brk.setRange(0, 100)
+        self.weight_brk.setValue(25)
+        self.weight_pat = QSpinBox()
+        self.weight_pat.setRange(0, 100)
+        self.weight_pat.setValue(15)
+        self.weight_macd = QSpinBox()
+        self.weight_macd.setRange(0, 100)
+        self.weight_macd.setValue(5)
+        self.weight_rsi = QSpinBox()
+        self.weight_rsi.setRange(0, 100)
+        self.weight_rsi.setValue(5)
+        self.btn_reset_weights = QPushButton("重置默认")
+        weight_layout.addWidget(QLabel("量能"))
+        weight_layout.addWidget(self.weight_vol)
+        weight_layout.addWidget(QLabel("均线"))
+        weight_layout.addWidget(self.weight_ma)
+        weight_layout.addWidget(QLabel("突破"))
+        weight_layout.addWidget(self.weight_brk)
+        weight_layout.addWidget(QLabel("形态"))
+        weight_layout.addWidget(self.weight_pat)
+        weight_layout.addWidget(QLabel("MACD"))
+        weight_layout.addWidget(self.weight_macd)
+        weight_layout.addWidget(QLabel("RSI"))
+        weight_layout.addWidget(self.weight_rsi)
+        weight_layout.addWidget(self.btn_reset_weights)
+        weight_group.setLayout(weight_layout)
+        filters_layout.addWidget(weight_group)
+
+        # --- 回测配置 ---
+        bt_group = QGroupBox("回测配置")
+        bt_layout = QHBoxLayout()
+        self.bt_lookback = QSpinBox()
+        self.bt_lookback.setRange(5, 300)
+        self.bt_lookback.setValue(60)
+        self.bt_forward = QSpinBox()
+        self.bt_forward.setRange(1, 60)
+        self.bt_forward.setValue(5)
+        self.bt_fee_bps = QSpinBox()
+        self.bt_fee_bps.setRange(0, 100)
+        self.bt_fee_bps.setValue(3)
+        self.bt_topk = QSpinBox()
+        self.bt_topk.setRange(0, 200)
+        self.bt_topk.setValue(0)
+        self.bt_entry_mode = QComboBox()
+        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])  # close | next_open
+        self.bt_exit_mode = QComboBox()
+        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])  # close | open
+        self.bt_exclude_limit = QCheckBox("排除信号日涨停")
+        self.bt_limit_th = QSpinBox()
+        self.bt_limit_th.setRange(0, 20)
+        self.bt_limit_th.setValue(10)
+        bt_layout.addWidget(QLabel("回看窗口N:"))
+        bt_layout.addWidget(self.bt_lookback)
+        bt_layout.addWidget(QLabel("前瞻天数n:"))
+        bt_layout.addWidget(self.bt_forward)
+        bt_layout.addWidget(QLabel("单边手续费‰:"))
+        bt_layout.addWidget(self.bt_fee_bps)
+        bt_layout.addWidget(QLabel("每日TopK(0不限):"))
+        bt_layout.addWidget(self.bt_topk)
+        bt_layout.addWidget(self.bt_entry_mode)
+        bt_layout.addWidget(self.bt_exit_mode)
+        bt_layout.addWidget(self.bt_exclude_limit)
+        bt_layout.addWidget(QLabel("涨停阈值%:"))
+        bt_layout.addWidget(self.bt_limit_th)
+        bt_group.setLayout(bt_layout)
+        filters_layout.addWidget(bt_group)
+
+        filters_layout.addStretch(1)
+        filters_container.setLayout(filters_layout)
+        scroll = QScrollArea()
+        scroll.setWidget(filters_container)
+        scroll.setWidgetResizable(True)
+        self.left_dock = QDockWidget("筛选条件", self)
+        self.left_dock.setWidget(scroll)
+        self.left_dock.setObjectName("dock_filters")
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+
+        # =============== 中央：结果表格 ===============
+        central = QWidget()
+        central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(8, 8, 8, 8)
+
+        # 顶部快速提示与搜索条（工具栏中提供更合适，这里仅放表格）
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"])
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        central_layout.addWidget(self.table)
+        central.setLayout(central_layout)
+        self.setCentralWidget(central)
+
+        # =============== 右侧：详情面板 ===============
+        self.detail_panel = QWidget()
+        dlayout = QVBoxLayout()
+        dlayout.setContentsMargins(8, 8, 8, 8)
+        self.detail_title = QLabel("选中行详情")
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        dlayout.addWidget(self.detail_title)
+        dlayout.addWidget(self.detail_text, 1)
+        self.detail_panel.setLayout(dlayout)
+        self.right_dock = QDockWidget("详情", self)
+        self.right_dock.setObjectName("dock_detail")
+        self.right_dock.setWidget(self.detail_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+
+        # =============== 顶部工具栏 ===============
+        self.init_toolbar()
+
+        # =============== 信号连接 ===============
+        self.table.cellDoubleClicked.connect(self.on_plot_kline)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.radio_recent.toggled.connect(self.toggle_date_mode)
+        self.radio_custom.toggled.connect(self.toggle_date_mode)
+        self.btn_reset_weights.clicked.connect(self.on_reset_weights)
+
+        # 还原窗口布局
+        try:
+            geo = self.settings.value("main/geometry")
+            state = self.settings.value("main/state")
+            if geo:
+                self.restoreGeometry(geo)
+            if state:
+                self.restoreState(state)
+        except Exception:
+            pass
+
+        # 初始信息
+        self.set_info("准备就绪")
+
+    # 主题样式
+    def apply_theme(self, dark: bool = True):
+        self._dark_theme = dark
+        if dark:
+            qss = """
+            QWidget { background-color: #121212; color: #E0E0E0; }
+            QGroupBox { border: 1px solid #2A2A2A; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #BDBDBD; }
+            QToolBar { background: #1E1E1E; border-bottom: 1px solid #2A2A2A; }
+            QStatusBar { background: #1E1E1E; }
+            QTableWidget { gridline-color: #2A2A2A; }
+            QHeaderView::section { background-color: #1E1E1E; color: #BDBDBD; border: 1px solid #2A2A2A; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #2D2D2D; border: 1px solid #3A3A3A; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #383838; }
+            QDockWidget::title { text-align: left; padding-left: 6px; }
+            QScrollBar:vertical { background: #1A1A1A; width: 10px; }
+            QScrollBar::handle:vertical { background: #3A3A3A; min-height: 30px; border-radius: 4px; }
+            """
+        else:
+            qss = """
+            QWidget { background-color: #FAFAFA; color: #212121; }
+            QGroupBox { border: 1px solid #DDDDDD; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #616161; }
+            QToolBar { background: #F5F5F5; border-bottom: 1px solid #E0E0E0; }
+            QStatusBar { background: #F5F5F5; }
+            QHeaderView::section { background-color: #F5F5F5; color: #616161; border: 1px solid #E0E0E0; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #FAFAFA; }
+            """
+        self.setStyleSheet(qss)
+
+    def init_toolbar(self):
+        tb = QToolBar("主工具栏", self)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(Qt.TopToolBarArea, tb)
+
+        # 标准图标
+        st = self.style()
+        icon_refresh = st.standardIcon(QStyle.SP_BrowserReload)
+        icon_run = st.standardIcon(QStyle.SP_MediaPlay)
+        icon_export = st.standardIcon(QStyle.SP_DialogSaveButton)
+        icon_info = st.standardIcon(QStyle.SP_MessageBoxInformation)
+        icon_theme = st.standardIcon(QStyle.SP_DialogHelpButton)
+
+        act_fetch = QAction(icon_refresh, "获取全部股票", self)
+        act_fetch.triggered.connect(self.on_fetch_data)
+        act_fetch.setShortcut("Ctrl+R")
+        tb.addAction(act_fetch)
+
+        act_select = QAction(icon_run, "执行选股", self)
+        act_select.triggered.connect(self.on_select_stock)
+        act_select.setShortcut("F5")
+        tb.addAction(act_select)
+
+        act_export = QAction(icon_export, "导出选股结果", self)
+        act_export.triggered.connect(self.on_export_excel)
+        act_export.setShortcut("Ctrl+E")
+        tb.addAction(act_export)
+
+        tb.addSeparator()
+
+        act_detail = QAction(icon_info, "查看详情", self)
+        act_detail.triggered.connect(self.on_view_detail)
+        act_detail.setShortcut("Enter")
+        tb.addAction(act_detail)
+
+        tb.addSeparator()
+
+        act_bt_run = QAction(icon_run, "运行回测", self)
+        act_bt_run.triggered.connect(self.on_run_backtest)
+        act_bt_run.setShortcut("Ctrl+B")
+        tb.addAction(act_bt_run)
+
+        act_bt_export = QAction(icon_export, "导出回测明细", self)
+        act_bt_export.triggered.connect(self.on_export_backtest)
+        act_bt_export.setShortcut("Ctrl+Shift+E")
+        tb.addAction(act_bt_export)
+
+        tb.addSeparator()
+
+        # 重置评分权重
+        act_reset_weights = QAction("重置权重", self)
+        act_reset_weights.triggered.connect(self.on_reset_weights)
+        tb.addAction(act_reset_weights)
+
+        # 主题切换
+        act_theme = QAction(icon_theme, "切换主题", self)
+        def _toggle_theme():
+            self.apply_theme(dark=not self._dark_theme)
+        act_theme.triggered.connect(_toggle_theme)
+        act_theme.setShortcut("Ctrl+T")
+        tb.addAction(act_theme)
+
+        # 搜索框
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索代码/名称  回车筛选/清空恢复")
+        self.search_edit.returnPressed.connect(self.apply_table_search)
+        wa = QWidgetAction(self)
+        wa.setDefaultWidget(self.search_edit)
+        tb.addAction(wa)
+
+    def init_ui(self):
+        # 主题与状态栏和 Dock 等已在上一段定义，这里继续原实现
+        self.apply_theme(dark=True)
+        self.setStatusBar(QStatusBar(self))
+        self.info_label = QLabel("欢迎使用A股选股分析工具")
+        self.statusBar().addPermanentWidget(self.info_label, 1)
+
+        # =============== 左侧：筛选器（放入可滚动 Dock） ===============
+        filters_container = QWidget()
+        filters_layout = QVBoxLayout()
+        filters_layout.setContentsMargins(8, 8, 8, 8)
+        filters_layout.setSpacing(8)
+
+        # --- 屏蔽前缀 ---
+        block_group = QGroupBox("屏蔽股票前缀")
+        block_layout = QHBoxLayout()
+        self.prefix_checkboxes = []
+        for prefix in ["30", "68", "4", "8"]:
+            cb = QCheckBox(prefix)
+            cb.setChecked(True)
+            self.prefix_checkboxes.append(cb)
+            block_layout.addWidget(cb)
+        block_group.setLayout(block_layout)
+        filters_layout.addWidget(block_group)
+
+        # --- 日期区间 ---
+        date_group = QGroupBox("日期区间")
+        date_layout = QHBoxLayout()
+        self.radio_recent = QRadioButton("最近N天")
+        self.radio_recent.setChecked(True)
+        self.spin_recent = QSpinBox()
+        self.spin_recent.setRange(1, 365)
+        self.spin_recent.setValue(20)
+        self.radio_custom = QRadioButton("自定义区间")
+        self.date_start = QDateEdit(QDate.currentDate().addDays(-20))
+        self.date_end = QDateEdit(QDate.currentDate())
+        self.date_start.setEnabled(False)
+        self.date_end.setEnabled(False)
+        date_layout.addWidget(self.radio_recent)
+        date_layout.addWidget(self.spin_recent)
+        date_layout.addWidget(self.radio_custom)
+        date_layout.addWidget(QLabel("起始:"))
+        date_layout.addWidget(self.date_start)
+        date_layout.addWidget(QLabel("结束:"))
+        date_layout.addWidget(self.date_end)
+        date_group.setLayout(date_layout)
+        filters_layout.addWidget(date_group)
+
+        # --- 涨幅筛选 ---
+        filter_group = QGroupBox("涨幅筛选")
+        filter_layout = QHBoxLayout()
+        self.pct_input = QLineEdit()
+        self.pct_input.setPlaceholderText("区间累计涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("区间累计涨幅大于:"))
+        filter_layout.addWidget(self.pct_input)
+        self.single_pct_input = QLineEdit()
+        self.single_pct_input.setPlaceholderText("单日涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("单日涨幅大于:"))
+        filter_layout.addWidget(self.single_pct_input)
+        self.single_days_spin = QSpinBox()
+        self.single_days_spin.setRange(1, 365)
+        self.single_days_spin.setValue(20)
+        filter_layout.addWidget(QLabel("在最近N天内:"))
+        filter_layout.addWidget(self.single_days_spin)
+        filter_group.setLayout(filter_layout)
+        filters_layout.addWidget(filter_group)
+
+        # --- 成交量策略 ---
+        vol_group = QGroupBox("成交量")
+        vol_layout = QHBoxLayout()
+        self.volume_mode = QComboBox()
+        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])  # None | volume_breakout | volume_pullback
+        self.volume_ma_days = QSpinBox()
+        self.volume_ma_days.setRange(1, 60)
+        self.volume_ma_days.setValue(5)
+        self.volume_ratio_min = QLineEdit()
+        self.volume_ratio_min.setPlaceholderText("放量阈值，如1.5")
+        self.volume_ratio_max = QLineEdit()
+        self.volume_ratio_max.setPlaceholderText("缩量阈值，如0.7")
+        self.cb_pullback_red = QCheckBox("回调需收阴")
+        self.touch_ma_spin = QSpinBox()
+        self.touch_ma_spin.setRange(0, 250)
+        self.touch_ma_spin.setValue(0)
+        vol_layout.addWidget(QLabel("模式:"))
+        vol_layout.addWidget(self.volume_mode)
+        vol_layout.addWidget(QLabel("量均线N:"))
+        vol_layout.addWidget(self.volume_ma_days)
+        vol_layout.addWidget(QLabel("放量≥:"))
+        vol_layout.addWidget(self.volume_ratio_min)
+        vol_layout.addWidget(QLabel("缩量≤:"))
+        vol_layout.addWidget(self.volume_ratio_max)
+        vol_layout.addWidget(self.cb_pullback_red)
+        vol_layout.addWidget(QLabel("回踩MA(N=0关闭):"))
+        vol_layout.addWidget(self.touch_ma_spin)
+        vol_group.setLayout(vol_layout)
+        filters_layout.addWidget(vol_group)
+
+        # --- 均线系统 ---
+        ma_group = QGroupBox("均线系统")
+        ma_layout = QHBoxLayout()
+        self.ma_days_input = QLineEdit("5,10,20")
+        self.ma_align_combo = QComboBox()
+        self.ma_align_combo.addItems(["无", "多头", "空头"])  # None | long | short
+        self.price_above_ma_spin = QSpinBox()
+        self.price_above_ma_spin.setRange(0, 250)
+        self.price_above_ma_spin.setValue(0)
+        ma_layout.addWidget(QLabel("MA天数(逗号):"))
+        ma_layout.addWidget(self.ma_days_input)
+        ma_layout.addWidget(QLabel("排列:"))
+        ma_layout.addWidget(self.ma_align_combo)
+        ma_layout.addWidget(QLabel("价格在N日MA之上(0为关闭):"))
+        ma_layout.addWidget(self.price_above_ma_spin)
+        ma_group.setLayout(ma_layout)
+        filters_layout.addWidget(ma_group)
+
+        # --- 热度 ---
+        heat_group = QGroupBox("热度(新闻条数)")
+        heat_layout = QHBoxLayout()
+        self.heat_min_news = QSpinBox()
+        self.heat_min_news.setRange(0, 100000)
+        self.heat_min_news.setValue(0)
+        self.heat_window = QSpinBox()
+        self.heat_window.setRange(1, 60)
+        self.heat_window.setValue(5)
+        heat_layout.addWidget(QLabel("最小新闻数:"))
+        heat_layout.addWidget(self.heat_min_news)
+        heat_layout.addWidget(QLabel("统计窗口N:"))
+        heat_layout.addWidget(self.heat_window)
+        heat_group.setLayout(heat_layout)
+        filters_layout.addWidget(heat_group)
+
+        # --- 技术条件 ---
+        tech_group = QGroupBox("技术条件")
+        tech_layout = QHBoxLayout()
+        self.breakout_n_spin = QSpinBox()
+        self.breakout_n_spin.setRange(0, 250)
+        self.breakout_n_spin.setValue(0)
+        self.breakout_min_pct = QLineEdit()
+        self.breakout_min_pct.setPlaceholderText("突破最小幅度% 可空")
+        self.atr_period_spin = QSpinBox()
+        self.atr_period_spin.setRange(0, 250)
+        self.atr_period_spin.setValue(0)
+        self.atr_max_pct = QLineEdit()
+        self.atr_max_pct.setPlaceholderText("ATR/价 ≤ % 可空")
+        self.cb_macd = QCheckBox("MACD")
+        self.macd_rule = QComboBox()
+        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
+        self.cb_rsi = QCheckBox("RSI")
+        self.rsi_period_spin = QSpinBox()
+        self.rsi_period_spin.setRange(1, 250)
+        self.rsi_period_spin.setValue(14)
+        self.rsi_min = QLineEdit()
+        self.rsi_min.setPlaceholderText("RSI≥ 可空")
+        self.rsi_max = QLineEdit()
+        self.rsi_max.setPlaceholderText("RSI≤ 可空")
+        tech_layout.addWidget(QLabel("N日新高N:"))
+        tech_layout.addWidget(self.breakout_n_spin)
+        tech_layout.addWidget(QLabel("最小突破%:"))
+        tech_layout.addWidget(self.breakout_min_pct)
+        tech_layout.addWidget(QLabel("ATR周期:"))
+        tech_layout.addWidget(self.atr_period_spin)
+        tech_layout.addWidget(QLabel("ATR/价≤%:"))
+        tech_layout.addWidget(self.atr_max_pct)
+        tech_layout.addWidget(self.cb_macd)
+        tech_layout.addWidget(self.macd_rule)
+        tech_layout.addWidget(self.cb_rsi)
+        tech_layout.addWidget(self.rsi_period_spin)
+        tech_layout.addWidget(self.rsi_min)
+        tech_layout.addWidget(self.rsi_max)
+        tech_group.setLayout(tech_layout)
+        filters_layout.addWidget(tech_group)
+
+        # --- 板块 ---
+        board_group = QGroupBox("板块")
+        board_layout = QHBoxLayout()
+        self.board_in_input = QLineEdit()
+        self.board_in_input.setPlaceholderText("包含板块代码/名称，逗号分隔")
+        self.board_out_input = QLineEdit()
+        self.board_out_input.setPlaceholderText("排除板块代码/名称，逗号分隔")
+        board_layout.addWidget(QLabel("包含:"))
+        board_layout.addWidget(self.board_in_input)
+        board_layout.addWidget(QLabel("排除:"))
+        board_layout.addWidget(self.board_out_input)
+        board_group.setLayout(board_layout)
+        filters_layout.addWidget(board_group)
+
+        # --- 形态 ---
+        pattern_group = QGroupBox("K线形态")
+        pattern_layout = QHBoxLayout()
+        self.cb_engulf = QCheckBox("吞没")
+        self.cb_hammer = QCheckBox("锤子线")
+        self.cb_shoot = QCheckBox("射击之星")
+        self.cb_doji = QCheckBox("十字星")
+        self.pattern_window_spin = QSpinBox()
+        self.pattern_window_spin.setRange(1, 60)
+        self.pattern_window_spin.setValue(5)
+        pattern_layout.addWidget(self.cb_engulf)
+        pattern_layout.addWidget(self.cb_hammer)
+        pattern_layout.addWidget(self.cb_shoot)
+        pattern_layout.addWidget(self.cb_doji)
+        pattern_layout.addWidget(QLabel("检测最近N根:"))
+        pattern_layout.addWidget(self.pattern_window_spin)
+        pattern_group.setLayout(pattern_layout)
+        filters_layout.addWidget(pattern_group)
+
+        # --- 评分权重 ---
+        weight_group = QGroupBox("评分权重（仅对启用项计分，自动归一化到100）")
+        weight_layout = QHBoxLayout()
+        self.weight_vol = QSpinBox()
+        self.weight_vol.setRange(0, 100)
+        self.weight_vol.setValue(30)
+        self.weight_ma = QSpinBox()
+        self.weight_ma.setRange(0, 100)
+        self.weight_ma.setValue(20)
+        self.weight_brk = QSpinBox()
+        self.weight_brk.setRange(0, 100)
+        self.weight_brk.setValue(25)
+        self.weight_pat = QSpinBox()
+        self.weight_pat.setRange(0, 100)
+        self.weight_pat.setValue(15)
+        self.weight_macd = QSpinBox()
+        self.weight_macd.setRange(0, 100)
+        self.weight_macd.setValue(5)
+        self.weight_rsi = QSpinBox()
+        self.weight_rsi.setRange(0, 100)
+        self.weight_rsi.setValue(5)
+        self.btn_reset_weights = QPushButton("重置默认")
+        weight_layout.addWidget(QLabel("量能"))
+        weight_layout.addWidget(self.weight_vol)
+        weight_layout.addWidget(QLabel("均线"))
+        weight_layout.addWidget(self.weight_ma)
+        weight_layout.addWidget(QLabel("突破"))
+        weight_layout.addWidget(self.weight_brk)
+        weight_layout.addWidget(QLabel("形态"))
+        weight_layout.addWidget(self.weight_pat)
+        weight_layout.addWidget(QLabel("MACD"))
+        weight_layout.addWidget(self.weight_macd)
+        weight_layout.addWidget(QLabel("RSI"))
+        weight_layout.addWidget(self.weight_rsi)
+        weight_layout.addWidget(self.btn_reset_weights)
+        weight_group.setLayout(weight_layout)
+        filters_layout.addWidget(weight_group)
+
+        # --- 回测配置 ---
+        bt_group = QGroupBox("回测配置")
+        bt_layout = QHBoxLayout()
+        self.bt_lookback = QSpinBox()
+        self.bt_lookback.setRange(5, 300)
+        self.bt_lookback.setValue(60)
+        self.bt_forward = QSpinBox()
+        self.bt_forward.setRange(1, 60)
+        self.bt_forward.setValue(5)
+        self.bt_fee_bps = QSpinBox()
+        self.bt_fee_bps.setRange(0, 100)
+        self.bt_fee_bps.setValue(3)
+        self.bt_topk = QSpinBox()
+        self.bt_topk.setRange(0, 200)
+        self.bt_topk.setValue(0)
+        self.bt_entry_mode = QComboBox()
+        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])  # close | next_open
+        self.bt_exit_mode = QComboBox()
+        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])  # close | open
+        self.bt_exclude_limit = QCheckBox("排除信号日涨停")
+        self.bt_limit_th = QSpinBox()
+        self.bt_limit_th.setRange(0, 20)
+        self.bt_limit_th.setValue(10)
+        bt_layout.addWidget(QLabel("回看窗口N:"))
+        bt_layout.addWidget(self.bt_lookback)
+        bt_layout.addWidget(QLabel("前瞻天数n:"))
+        bt_layout.addWidget(self.bt_forward)
+        bt_layout.addWidget(QLabel("单边手续费‰:"))
+        bt_layout.addWidget(self.bt_fee_bps)
+        bt_layout.addWidget(QLabel("每日TopK(0不限):"))
+        bt_layout.addWidget(self.bt_topk)
+        bt_layout.addWidget(self.bt_entry_mode)
+        bt_layout.addWidget(self.bt_exit_mode)
+        bt_layout.addWidget(self.bt_exclude_limit)
+        bt_layout.addWidget(QLabel("涨停阈值%:"))
+        bt_layout.addWidget(self.bt_limit_th)
+        bt_group.setLayout(bt_layout)
+        filters_layout.addWidget(bt_group)
+
+        filters_layout.addStretch(1)
+        filters_container.setLayout(filters_layout)
+        scroll = QScrollArea()
+        scroll.setWidget(filters_container)
+        scroll.setWidgetResizable(True)
+        self.left_dock = QDockWidget("筛选条件", self)
+        self.left_dock.setWidget(scroll)
+        self.left_dock.setObjectName("dock_filters")
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+
+        # =============== 中央：结果表格 ===============
+        central = QWidget()
+        central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(8, 8, 8, 8)
+
+        # 顶部快速提示与搜索条（工具栏中提供更合适，这里仅放表格）
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"])
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        central_layout.addWidget(self.table)
+        central.setLayout(central_layout)
+        self.setCentralWidget(central)
+
+        # =============== 右侧：详情面板 ===============
+        self.detail_panel = QWidget()
+        dlayout = QVBoxLayout()
+        dlayout.setContentsMargins(8, 8, 8, 8)
+        self.detail_title = QLabel("选中行详情")
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        dlayout.addWidget(self.detail_title)
+        dlayout.addWidget(self.detail_text, 1)
+        self.detail_panel.setLayout(dlayout)
+        self.right_dock = QDockWidget("详情", self)
+        self.right_dock.setObjectName("dock_detail")
+        self.right_dock.setWidget(self.detail_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+
+        # =============== 顶部工具栏 ===============
+        self.init_toolbar()
+
+        # =============== 信号连接 ===============
+        self.table.cellDoubleClicked.connect(self.on_plot_kline)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.radio_recent.toggled.connect(self.toggle_date_mode)
+        self.radio_custom.toggled.connect(self.toggle_date_mode)
+        self.btn_reset_weights.clicked.connect(self.on_reset_weights)
+
+        # 还原窗口布局
+        try:
+            geo = self.settings.value("main/geometry")
+            state = self.settings.value("main/state")
+            if geo:
+                self.restoreGeometry(geo)
+            if state:
+                self.restoreState(state)
+        except Exception:
+            pass
+
+        # 初始信息
+        self.set_info("准备就绪")
+
+    # 主题样式
+    def apply_theme(self, dark: bool = True):
+        self._dark_theme = dark
+        if dark:
+            qss = """
+            QWidget { background-color: #121212; color: #E0E0E0; }
+            QGroupBox { border: 1px solid #2A2A2A; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #BDBDBD; }
+            QToolBar { background: #1E1E1E; border-bottom: 1px solid #2A2A2A; }
+            QStatusBar { background: #1E1E1E; }
+            QTableWidget { gridline-color: #2A2A2A; }
+            QHeaderView::section { background-color: #1E1E1E; color: #BDBDBD; border: 1px solid #2A2A2A; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #2D2D2D; border: 1px solid #3A3A3A; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #383838; }
+            QDockWidget::title { text-align: left; padding-left: 6px; }
+            QScrollBar:vertical { background: #1A1A1A; width: 10px; }
+            QScrollBar::handle:vertical { background: #3A3A3A; min-height: 30px; border-radius: 4px; }
+            """
+        else:
+            qss = """
+            QWidget { background-color: #FAFAFA; color: #212121; }
+            QGroupBox { border: 1px solid #DDDDDD; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #616161; }
+            QToolBar { background: #F5F5F5; border-bottom: 1px solid #E0E0E0; }
+            QStatusBar { background: #F5F5F5; }
+            QHeaderView::section { background-color: #F5F5F5; color: #616161; border: 1px solid #E0E0E0; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #FAFAFA; }
+            """
+        self.setStyleSheet(qss)
+
+    def init_toolbar(self):
+        tb = QToolBar("主工具栏", self)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(Qt.TopToolBarArea, tb)
+
+        # 标准图标
+        st = self.style()
+        icon_refresh = st.standardIcon(QStyle.SP_BrowserReload)
+        icon_run = st.standardIcon(QStyle.SP_MediaPlay)
+        icon_export = st.standardIcon(QStyle.SP_DialogSaveButton)
+        icon_info = st.standardIcon(QStyle.SP_MessageBoxInformation)
+        icon_theme = st.standardIcon(QStyle.SP_DialogHelpButton)
+
+        act_fetch = QAction(icon_refresh, "获取全部股票", self)
+        act_fetch.triggered.connect(self.on_fetch_data)
+        act_fetch.setShortcut("Ctrl+R")
+        tb.addAction(act_fetch)
+
+        act_select = QAction(icon_run, "执行选股", self)
+        act_select.triggered.connect(self.on_select_stock)
+        act_select.setShortcut("F5")
+        tb.addAction(act_select)
+
+        act_export = QAction(icon_export, "导出选股结果", self)
+        act_export.triggered.connect(self.on_export_excel)
+        act_export.setShortcut("Ctrl+E")
+        tb.addAction(act_export)
+
+        tb.addSeparator()
+
+        act_detail = QAction(icon_info, "查看详情", self)
+        act_detail.triggered.connect(self.on_view_detail)
+        act_detail.setShortcut("Enter")
+        tb.addAction(act_detail)
+
+        tb.addSeparator()
+
+        act_bt_run = QAction(icon_run, "运行回测", self)
+        act_bt_run.triggered.connect(self.on_run_backtest)
+        act_bt_run.setShortcut("Ctrl+B")
+        tb.addAction(act_bt_run)
+
+        act_bt_export = QAction(icon_export, "导出回测明细", self)
+        act_bt_export.triggered.connect(self.on_export_backtest)
+        act_bt_export.setShortcut("Ctrl+Shift+E")
+        tb.addAction(act_bt_export)
+
+        tb.addSeparator()
+
+        # 重置评分权重
+        act_reset_weights = QAction("重置权重", self)
+        act_reset_weights.triggered.connect(self.on_reset_weights)
+        tb.addAction(act_reset_weights)
+
+        # 主题切换
+        act_theme = QAction(icon_theme, "切换主题", self)
+        def _toggle_theme():
+            self.apply_theme(dark=not self._dark_theme)
+        act_theme.triggered.connect(_toggle_theme)
+        act_theme.setShortcut("Ctrl+T")
+        tb.addAction(act_theme)
+
+        # 搜索框
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索代码/名称  回车筛选/清空恢复")
+        self.search_edit.returnPressed.connect(self.apply_table_search)
+        wa = QWidgetAction(self)
+        wa.setDefaultWidget(self.search_edit)
+        tb.addAction(wa)
+
+    def init_ui(self):
+        # 主题与状态栏和 Dock 等已在上一段定义，这里继续原实现
+        self.apply_theme(dark=True)
+        self.setStatusBar(QStatusBar(self))
+        self.info_label = QLabel("欢迎使用A股选股分析工具")
+        self.statusBar().addPermanentWidget(self.info_label, 1)
+
+        # =============== 左侧：筛选器（放入可滚动 Dock） ===============
+        filters_container = QWidget()
+        filters_layout = QVBoxLayout()
+        filters_layout.setContentsMargins(8, 8, 8, 8)
+        filters_layout.setSpacing(8)
+
+        # --- 屏蔽前缀 ---
+        block_group = QGroupBox("屏蔽股票前缀")
+        block_layout = QHBoxLayout()
+        self.prefix_checkboxes = []
+        for prefix in ["30", "68", "4", "8"]:
+            cb = QCheckBox(prefix)
+            cb.setChecked(True)
+            self.prefix_checkboxes.append(cb)
+            block_layout.addWidget(cb)
+        block_group.setLayout(block_layout)
+        filters_layout.addWidget(block_group)
+
+        # --- 日期区间 ---
+        date_group = QGroupBox("日期区间")
+        date_layout = QHBoxLayout()
+        self.radio_recent = QRadioButton("最近N天")
+        self.radio_recent.setChecked(True)
+        self.spin_recent = QSpinBox()
+        self.spin_recent.setRange(1, 365)
+        self.spin_recent.setValue(20)
+        self.radio_custom = QRadioButton("自定义区间")
+        self.date_start = QDateEdit(QDate.currentDate().addDays(-20))
+        self.date_end = QDateEdit(QDate.currentDate())
+        self.date_start.setEnabled(False)
+        self.date_end.setEnabled(False)
+        date_layout.addWidget(self.radio_recent)
+        date_layout.addWidget(self.spin_recent)
+        date_layout.addWidget(self.radio_custom)
+        date_layout.addWidget(QLabel("起始:"))
+        date_layout.addWidget(self.date_start)
+        date_layout.addWidget(QLabel("结束:"))
+        date_layout.addWidget(self.date_end)
+        date_group.setLayout(date_layout)
+        filters_layout.addWidget(date_group)
+
+        # --- 涨幅筛选 ---
+        filter_group = QGroupBox("涨幅筛选")
+        filter_layout = QHBoxLayout()
+        self.pct_input = QLineEdit()
+        self.pct_input.setPlaceholderText("区间累计涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("区间累计涨幅大于:"))
+        filter_layout.addWidget(self.pct_input)
+        self.single_pct_input = QLineEdit()
+        self.single_pct_input.setPlaceholderText("单日涨幅大于(%)，如8")
+        filter_layout.addWidget(QLabel("单日涨幅大于:"))
+        filter_layout.addWidget(self.single_pct_input)
+        self.single_days_spin = QSpinBox()
+        self.single_days_spin.setRange(1, 365)
+        self.single_days_spin.setValue(20)
+        filter_layout.addWidget(QLabel("在最近N天内:"))
+        filter_layout.addWidget(self.single_days_spin)
+        filter_group.setLayout(filter_layout)
+        filters_layout.addWidget(filter_group)
+
+        # --- 成交量策略 ---
+        vol_group = QGroupBox("成交量")
+        vol_layout = QHBoxLayout()
+        self.volume_mode = QComboBox()
+        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])  # None | volume_breakout | volume_pullback
+        self.volume_ma_days = QSpinBox()
+        self.volume_ma_days.setRange(1, 60)
+        self.volume_ma_days.setValue(5)
+        self.volume_ratio_min = QLineEdit()
+        self.volume_ratio_min.setPlaceholderText("放量阈值，如1.5")
+        self.volume_ratio_max = QLineEdit()
+        self.volume_ratio_max.setPlaceholderText("缩量阈值，如0.7")
+        self.cb_pullback_red = QCheckBox("回调需收阴")
+        self.touch_ma_spin = QSpinBox()
+        self.touch_ma_spin.setRange(0, 250)
+        self.touch_ma_spin.setValue(0)
+        vol_layout.addWidget(QLabel("模式:"))
+        vol_layout.addWidget(self.volume_mode)
+        vol_layout.addWidget(QLabel("量均线N:"))
+        vol_layout.addWidget(self.volume_ma_days)
+        vol_layout.addWidget(QLabel("放量≥:"))
+        vol_layout.addWidget(self.volume_ratio_min)
+        vol_layout.addWidget(QLabel("缩量≤:"))
+        vol_layout.addWidget(self.volume_ratio_max)
+        vol_layout.addWidget(self.cb_pullback_red)
+        vol_layout.addWidget(QLabel("回踩MA(N=0关闭):"))
+        vol_layout.addWidget(self.touch_ma_spin)
+        vol_group.setLayout(vol_layout)
+        filters_layout.addWidget(vol_group)
+
+        # --- 均线系统 ---
+        ma_group = QGroupBox("均线系统")
+        ma_layout = QHBoxLayout()
+        self.ma_days_input = QLineEdit("5,10,20")
+        self.ma_align_combo = QComboBox()
+        self.ma_align_combo.addItems(["无", "多头", "空头"])  # None | long | short
+        self.price_above_ma_spin = QSpinBox()
+        self.price_above_ma_spin.setRange(0, 250)
+        self.price_above_ma_spin.setValue(0)
+        ma_layout.addWidget(QLabel("MA天数(逗号):"))
+        ma_layout.addWidget(self.ma_days_input)
+        ma_layout.addWidget(QLabel("排列:"))
+        ma_layout.addWidget(self.ma_align_combo)
+        ma_layout.addWidget(QLabel("价格在N日MA之上(0为关闭):"))
+        ma_layout.addWidget(self.price_above_ma_spin)
+        ma_group.setLayout(ma_layout)
+        filters_layout.addWidget(ma_group)
+
+        # --- 热度 ---
+        heat_group = QGroupBox("热度(新闻条数)")
+        heat_layout = QHBoxLayout()
+        self.heat_min_news = QSpinBox()
+        self.heat_min_news.setRange(0, 100000)
+        self.heat_min_news.setValue(0)
+        self.heat_window = QSpinBox()
+        self.heat_window.setRange(1, 60)
+        self.heat_window.setValue(5)
+        heat_layout.addWidget(QLabel("最小新闻数:"))
+        heat_layout.addWidget(self.heat_min_news)
+        heat_layout.addWidget(QLabel("统计窗口N:"))
+        heat_layout.addWidget(self.heat_window)
+        heat_group.setLayout(heat_layout)
+        filters_layout.addWidget(heat_group)
+
+        # --- 技术条件 ---
+        tech_group = QGroupBox("技术条件")
+        tech_layout = QHBoxLayout()
+        self.breakout_n_spin = QSpinBox()
+        self.breakout_n_spin.setRange(0, 250)
+        self.breakout_n_spin.setValue(0)
+        self.breakout_min_pct = QLineEdit()
+        self.breakout_min_pct.setPlaceholderText("突破最小幅度% 可空")
+        self.atr_period_spin = QSpinBox()
+        self.atr_period_spin.setRange(0, 250)
+        self.atr_period_spin.setValue(0)
+        self.atr_max_pct = QLineEdit()
+        self.atr_max_pct.setPlaceholderText("ATR/价 ≤ % 可空")
+        self.cb_macd = QCheckBox("MACD")
+        self.macd_rule = QComboBox()
+        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
+        self.cb_rsi = QCheckBox("RSI")
+        self.rsi_period_spin = QSpinBox()
+        self.rsi_period_spin.setRange(1, 250)
+        self.rsi_period_spin.setValue(14)
+        self.rsi_min = QLineEdit()
+        self.rsi_min.setPlaceholderText("RSI≥ 可空")
+        self.rsi_max = QLineEdit()
+        self.rsi_max.setPlaceholderText("RSI≤ 可空")
+        tech_layout.addWidget(QLabel("N日新高N:"))
+        tech_layout.addWidget(self.breakout_n_spin)
+        tech_layout.addWidget(QLabel("最小突破%:"))
+        tech_layout.addWidget(self.breakout_min_pct)
+        tech_layout.addWidget(QLabel("ATR周期:"))
+        tech_layout.addWidget(self.atr_period_spin)
+        tech_layout.addWidget(QLabel("ATR/价≤%:"))
+        tech_layout.addWidget(self.atr_max_pct)
+        tech_layout.addWidget(self.cb_macd)
+        tech_layout.addWidget(self.macd_rule)
+        tech_layout.addWidget(self.cb_rsi)
+        tech_layout.addWidget(self.rsi_period_spin)
+        tech_layout.addWidget(self.rsi_min)
+        tech_layout.addWidget(self.rsi_max)
+        tech_group.setLayout(tech_layout)
+        filters_layout.addWidget(tech_group)
+
+        # --- 板块 ---
+        board_group = QGroupBox("板块")
+        board_layout = QHBoxLayout()
+        self.board_in_input = QLineEdit()
+        self.board_in_input.setPlaceholderText("包含板块代码/名称，逗号分隔")
+        self.board_out_input = QLineEdit()
+        self.board_out_input.setPlaceholderText("排除板块代码/名称，逗号分隔")
+        board_layout.addWidget(QLabel("包含:"))
+        board_layout.addWidget(self.board_in_input)
+        board_layout.addWidget(QLabel("排除:"))
+        board_layout.addWidget(self.board_out_input)
+        board_group.setLayout(board_layout)
+        filters_layout.addWidget(board_group)
+
+        # --- 形态 ---
+        pattern_group = QGroupBox("K线形态")
+        pattern_layout = QHBoxLayout()
+        self.cb_engulf = QCheckBox("吞没")
+        self.cb_hammer = QCheckBox("锤子线")
+        self.cb_shoot = QCheckBox("射击之星")
+        self.cb_doji = QCheckBox("十字星")
+        self.pattern_window_spin = QSpinBox()
+        self.pattern_window_spin.setRange(1, 60)
+        self.pattern_window_spin.setValue(5)
+        pattern_layout.addWidget(self.cb_engulf)
+        pattern_layout.addWidget(self.cb_hammer)
+        pattern_layout.addWidget(self.cb_shoot)
+        pattern_layout.addWidget(self.cb_doji)
+        pattern_layout.addWidget(QLabel("检测最近N根:"))
+        pattern_layout.addWidget(self.pattern_window_spin)
+        pattern_group.setLayout(pattern_layout)
+        filters_layout.addWidget(pattern_group)
+
+        # --- 评分权重 ---
+        weight_group = QGroupBox("评分权重（仅对启用项计分，自动归一化到100）")
+        weight_layout = QHBoxLayout()
+        self.weight_vol = QSpinBox()
+        self.weight_vol.setRange(0, 100)
+        self.weight_vol.setValue(30)
+        self.weight_ma = QSpinBox()
+        self.weight_ma.setRange(0, 100)
+        self.weight_ma.setValue(20)
+        self.weight_brk = QSpinBox()
+        self.weight_brk.setRange(0, 100)
+        self.weight_brk.setValue(25)
+        self.weight_pat = QSpinBox()
+        self.weight_pat.setRange(0, 100)
+        self.weight_pat.setValue(15)
+        self.weight_macd = QSpinBox()
+        self.weight_macd.setRange(0, 100)
+        self.weight_macd.setValue(5)
+        self.weight_rsi = QSpinBox()
+        self.weight_rsi.setRange(0, 100)
+        self.weight_rsi.setValue(5)
+        self.btn_reset_weights = QPushButton("重置默认")
+        weight_layout.addWidget(QLabel("量能"))
+        weight_layout.addWidget(self.weight_vol)
+        weight_layout.addWidget(QLabel("均线"))
+        weight_layout.addWidget(self.weight_ma)
+        weight_layout.addWidget(QLabel("突破"))
+        weight_layout.addWidget(self.weight_brk)
+        weight_layout.addWidget(QLabel("形态"))
+        weight_layout.addWidget(self.weight_pat)
+        weight_layout.addWidget(QLabel("MACD"))
+        weight_layout.addWidget(self.weight_macd)
+        weight_layout.addWidget(QLabel("RSI"))
+        weight_layout.addWidget(self.weight_rsi)
+        weight_layout.addWidget(self.btn_reset_weights)
+        weight_group.setLayout(weight_layout)
+        filters_layout.addWidget(weight_group)
+
+        # --- 回测配置 ---
+        bt_group = QGroupBox("回测配置")
+        bt_layout = QHBoxLayout()
+        self.bt_lookback = QSpinBox()
+        self.bt_lookback.setRange(5, 300)
+        self.bt_lookback.setValue(60)
+        self.bt_forward = QSpinBox()
+        self.bt_forward.setRange(1, 60)
+        self.bt_forward.setValue(5)
+        self.bt_fee_bps = QSpinBox()
+        self.bt_fee_bps.setRange(0, 100)
+        self.bt_fee_bps.setValue(3)
+        self.bt_topk = QSpinBox()
+        self.bt_topk.setRange(0, 200)
+        self.bt_topk.setValue(0)
+        self.bt_entry_mode = QComboBox()
+        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])  # close | next_open
+        self.bt_exit_mode = QComboBox()
+        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])  # close | open
+        self.bt_exclude_limit = QCheckBox("排除信号日涨停")
+        self.bt_limit_th = QSpinBox()
+        self.bt_limit_th.setRange(0, 20)
+        self.bt_limit_th.setValue(10)
+        bt_layout.addWidget(QLabel("回看窗口N:"))
+        bt_layout.addWidget(self.bt_lookback)
+        bt_layout.addWidget(QLabel("前瞻天数n:"))
+        bt_layout.addWidget(self.bt_forward)
+        bt_layout.addWidget(QLabel("单边手续费‰:"))
+        bt_layout.addWidget(self.bt_fee_bps)
+        bt_layout.addWidget(QLabel("每日TopK(0不限):"))
+        bt_layout.addWidget(self.bt_topk)
+        bt_layout.addWidget(self.bt_entry_mode)
+        bt_layout.addWidget(self.bt_exit_mode)
+        bt_layout.addWidget(self.bt_exclude_limit)
+        bt_layout.addWidget(QLabel("涨停阈值%:"))
+        bt_layout.addWidget(self.bt_limit_th)
+        bt_group.setLayout(bt_layout)
+        filters_layout.addWidget(bt_group)
+
+        filters_layout.addStretch(1)
+        filters_container.setLayout(filters_layout)
+        scroll = QScrollArea()
+        scroll.setWidget(filters_container)
+        scroll.setWidgetResizable(True)
+        self.left_dock = QDockWidget("筛选条件", self)
+        self.left_dock.setWidget(scroll)
+        self.left_dock.setObjectName("dock_filters")
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+
+        # =============== 中央：结果表格 ===============
+        central = QWidget()
+        central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(8, 8, 8, 8)
+
+        # 顶部快速提示与搜索条（工具栏中提供更合适，这里仅放表格）
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"])
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        central_layout.addWidget(self.table)
+        central.setLayout(central_layout)
+        self.setCentralWidget(central)
+
+        # =============== 右侧：详情面板 ===============
+        self.detail_panel = QWidget()
+        dlayout = QVBoxLayout()
+        dlayout.setContentsMargins(8, 8, 8, 8)
+        self.detail_title = QLabel("选中行详情")
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        dlayout.addWidget(self.detail_title)
+        dlayout.addWidget(self.detail_text, 1)
+        self.detail_panel.setLayout(dlayout)
+        self.right_dock = QDockWidget("详情", self)
+        self.right_dock.setObjectName("dock_detail")
+        self.right_dock.setWidget(self.detail_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+
+        # =============== 顶部工具栏 ===============
+        self.init_toolbar()
+
+        # =============== 信号连接 ===============
+        self.table.cellDoubleClicked.connect(self.on_plot_kline)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.radio_recent.toggled.connect(self.toggle_date_mode)
+        self.radio_custom.toggled.connect(self.toggle_date_mode)
+        self.btn_reset_weights.clicked.connect(self.on_reset_weights)
+
+        # 还原窗口布局
+        try:
+            geo = self.settings.value("main/geometry")
+            state = self.settings.value("main/state")
+            if geo:
+                self.restoreGeometry(geo)
+            if state:
+                self.restoreState(state)
+        except Exception:
+            pass
+
+        # 初始信息
+        self.set_info("准备就绪")
+
+    # 主题样式
+    def apply_theme(self, dark: bool = True):
+        self._dark_theme = dark
+        if dark:
+            qss = """
+            QWidget { background-color: #121212; color: #E0E0E0; }
+            QGroupBox { border: 1px solid #2A2A2A; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #BDBDBD; }
+            QToolBar { background: #1E1E1E; border-bottom: 1px solid #2A2A2A; }
+            QStatusBar { background: #1E1E1E; }
+            QTableWidget { gridline-color: #2A2A2A; }
+            QHeaderView::section { background-color: #1E1E1E; color: #BDBDBD; border: 1px solid #2A2A2A; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #2D2D2D; border: 1px solid #3A3A3A; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #383838; }
+            QDockWidget::title { text-align: left; padding-left: 6px; }
+            QScrollBar:vertical { background: #1A1A1A; width: 10px; }
+            QScrollBar::handle:vertical { background: #3A3A3A; min-height: 30px; border-radius: 4px; }
+            """
+        else:
+            qss = """
+            QWidget { background-color: #FAFAFA; color: #212121; }
+            QGroupBox { border: 1px solid #DDDDDD; margin-top: 8px; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #616161; }
+            QToolBar { background: #F5F5F5; border-bottom: 1px solid #E0E0E0; }
+            QStatusBar { background: #F5F5F5; }
+            QHeaderView::section { background-color: #F5F5F5; color: #616161; border: 1px solid #E0E0E0; padding: 4px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 3px; }
+            QPushButton { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background: #FAFAFA; }
+            """
+        self.setStyleSheet(qss)
+
+    def init_toolbar(self):
+        tb = QToolBar("主工具栏", self)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(Qt.TopToolBarArea, tb)
+
+        # 标准图标
+        st = self.style()
+        icon_refresh = st.standardIcon(QStyle.SP_BrowserReload)
+        icon_run = st.standardIcon(QStyle.SP_MediaPlay)
+        icon_export = st.standardIcon(QStyle.SP_DialogSaveButton)
+        icon_info = st.standardIcon(QStyle.SP_MessageBoxInformation)
+        icon_theme = st.standardIcon(QStyle.SP_DialogHelpButton)
+
+        act_fetch = QAction(icon_refresh, "获取全部股票", self)
+        act_fetch.triggered.connect(self.on_fetch_data)
+        act_fetch.setShortcut("Ctrl+R")
+        tb.addAction(act_fetch)
+
+        act_select = QAction(icon_run, "执行选股", self)
+        act_select.triggered.connect(self.on_select_stock)
+        act_select.setShortcut("F5")
+        tb.addAction(act_select)
+
+        act_export = QAction(icon_export, "导出选股结果", self)
+        act_export.triggered.connect(self.on_export_excel)
+        act_export.setShortcut("Ctrl+E")
+        tb.addAction(act_export)
+
+        tb.addSeparator()
+
+        act_detail = QAction(icon_info, "查看详情", self)
+        act_detail.triggered.connect(self.on_view_detail)
+        act_detail.setShortcut("Enter")
+        tb.addAction(act_detail)
+
+        tb.addSeparator()
+
+        act_bt_run = QAction(icon_run, "运行回测", self)
+        act_bt_run.triggered.connect(self.on_run_backtest)
+        act_bt_run.setShortcut("Ctrl+B")
+        tb.addAction(act_bt_run)
+
+        act_bt_export = QAction(icon_export, "导出回测明细", self)
+        act_bt_export.triggered.connect(self.on_export_backtest)
+        act_bt_export.setShortcut("Ctrl+Shift+E")
+        tb.addAction(act_bt_export)
+
+        tb.addSeparator()
+
+        # 重置评分权重
+        act_reset_weights = QAction("重置权重", self)
+        act_reset_weights.triggered.connect(self.on_reset_weights)
+        tb.addAction(act_reset_weights)
+
+        # 主题切换
+        act_theme = QAction(icon_theme, "切换主题", self)
+        def _toggle_theme():
+            self.apply_theme(dark=not self._dark_theme)
+        act_theme.triggered.connect(_toggle_theme)
+        act_theme.setShortcut("Ctrl+T")
+        tb.addAction(act_theme)
+
+        # 搜索框
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索代码/名称  回车筛选/清空恢复")
+        self.search_edit.returnPressed.connect(self.apply_table_search)
+        wa = QWidgetAction(self)
+        wa.setDefaultWidget(self.search_edit)
+        tb.addAction(wa)
+
+    def init_ui(self):
+        # 主题与状态栏和 Dock 等已在上一段定义，这里继续原实现
+        self.apply_theme(dark=True)
+        self.setStatusBar(QStatusBar(self))
+        self.info_label = QLabel("欢迎使用A股选股分析工具")
+        self.statusBar().addPermanentWidget(self.info_label, 1)
+
+        # =============== 左侧：筛选器（放入可滚动 Dock） ===============

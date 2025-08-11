@@ -2,3 +2,7 @@ PyQt5
 akshare
 pandas
 matplotlib
+tushare
+toml
+openpyxl
+requests
