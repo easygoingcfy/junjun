@@ -1,2 +1,18 @@
 [tushare]
 token = "02faaa2106b4c24cac03c90f494aa9cb68b6ff3c37781532deea18a1"
+
+[ingest]
+# 概念与成分
+do_concept = false
+# 指数/板块与成分，以及板块日线
+do_boards = false
+# 同花顺行业板块与日线
+do_industry_boards = false
+# 个股日线增量
+do_stocks_daily = true
+# 个股日线优先按交易日批量抓取（需要 TuShare）
+do_stocks_daily_batch = true
+# 新闻条数热度
+do_news_heat = false
+# 限制板块/行业板块日线仅回填最近N天
+board_recent_days = 7

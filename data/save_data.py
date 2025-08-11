@@ -50,6 +50,23 @@ class DataSaver:
             ))
         self.db.conn.commit()
 
+    # 新增：批量保存日线（按交易日批量抓取后直接写入）
+    def bulk_save_daily_kline(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        records = [(
+            row.get('ts_code'), row.get('trade_date'), row.get('open'), row.get('high'), row.get('low'),
+            row.get('close'), row.get('vol'), row.get('amount'), row.get('pct_chg'), row.get('turnover_rate'),
+            row.get('pre_close'), row.get('amplitude'), row.get('volume_ratio'), row.get('circ_mv'), row.get('total_mv')
+        ) for _, row in df.iterrows()]
+        cursor = self.db.conn.cursor()
+        cursor.executemany('''
+            INSERT OR REPLACE INTO daily_kline
+            (ts_code, trade_date, open, high, low, close, vol, amount, pct_chg, turnover_rate, pre_close, amplitude, volume_ratio, circ_mv, total_mv)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', records)
+        self.db.conn.commit()
+
     def save_concepts(self, df: pd.DataFrame):
         if df is None or df.empty:
             return
@@ -124,4 +141,19 @@ class DataSaver:
                 row.get('ts_code'), row.get('date'), row.get('source', ''), row.get('news_count'),
                 row.get('search_score'), row.get('forum_count'), row.get('sentiment'), row.get('board_hotness')
             ))
+        self.db.conn.commit()
+
+    # 新增：批量保存热度（可选）
+    def bulk_save_heat_data(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        records = [(
+            row.get('ts_code'), row.get('date'), row.get('source', ''), row.get('news_count'),
+            row.get('search_score'), row.get('forum_count'), row.get('sentiment'), row.get('board_hotness')
+        ) for _, row in df.iterrows()]
+        cur = self.db.conn.cursor()
+        cur.executemany('''
+            INSERT OR REPLACE INTO heat_data (ts_code, date, source, news_count, search_score, forum_count, sentiment, board_hotness)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', records)
         self.db.conn.commit()

@@ -101,6 +101,43 @@ class DataFetcher:
         print(f"[警告] 股票代码 {ts_code} ({symbol}) 所有数据源均失败，已跳过。")
         return pd.DataFrame()
 
+    # 新增：按交易日批量获取（TuShare）
+    def fetch_daily_by_date(self, trade_date: str) -> pd.DataFrame:
+        if not self.ts_pro:
+            return pd.DataFrame()
+        try:
+            daily = self.ts_pro.daily(trade_date=trade_date)
+            basic = self.ts_pro.daily_basic(trade_date=trade_date,
+                                            fields="ts_code,trade_date,turnover_rate,turnover_rate_f,volume_ratio,pe_ttm,pb,ps_ttm,total_mv,circ_mv")
+            if daily is None or daily.empty:
+                return pd.DataFrame()
+            df = pd.merge(daily, basic, on=['ts_code', 'trade_date'], how='left')
+            # TuShare daily 自带 pre_close
+            if 'pre_close' not in df.columns or df['pre_close'].isna().all():
+                df['pre_close'] = df['close']  # 容错
+            df['amplitude'] = (df['high'] - df['low']) / df['pre_close'] * 100
+            keep = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol', 'amount', 'pct_chg',
+                    'turnover_rate', 'pre_close', 'amplitude', 'volume_ratio', 'circ_mv', 'total_mv']
+            return df[keep]
+        except Exception as e:
+            print(f"[TuShare 按日批量失败] {trade_date}: {e}")
+            return pd.DataFrame()
+
+    # 新增：交易日历
+    def fetch_trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
+        if not self.ts_pro:
+            return pd.DataFrame()
+        try:
+            cal = self.ts_pro.trade_cal(exchange='', start_date=start_date, end_date=end_date)
+            if cal is None or cal.empty:
+                return pd.DataFrame()
+            cal = cal[cal['is_open'] == 1].copy()
+            cal.rename(columns={'cal_date': 'trade_date'}, inplace=True)
+            return cal[['trade_date']]
+        except Exception as e:
+            print(f"[TuShare 交易日历失败] {start_date}-{end_date}: {e}")
+            return pd.DataFrame()
+
     # 概念相关
     def fetch_concepts(self) -> pd.DataFrame:
         # TuShare 概念列表
