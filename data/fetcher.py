@@ -10,13 +10,22 @@ class DataFetcher:
         if tushare_token:
             self.ts_pro = ts.pro_api(tushare_token)
         else:
-            # 优先从项目根目录读取config.toml
-            config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config.toml'))
-            if os.path.exists(config_path):
-                config = toml.load(config_path)
-                token = config.get('tushare', {}).get('token', None)
-                if token:
-                    self.ts_pro = ts.pro_api(token)
+            # 优先从环境变量获取token
+            token = os.environ.get('TUSHARE_TOKEN')
+            if not token:
+                # 其次从config.local.toml读取（本地私密文件）
+                local_config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config.local.toml'))
+                if os.path.exists(local_config_path):
+                    local_config = toml.load(local_config_path)
+                    token = local_config.get('tushare', {}).get('token', None)
+            if not token:
+                # 最后从config.toml读取（但应为空，避免提交私密信息）
+                config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config.toml'))
+                if os.path.exists(config_path):
+                    config = toml.load(config_path)
+                    token = config.get('tushare', {}).get('token', None)
+            if token and token.strip():
+                self.ts_pro = ts.pro_api(token)
 
     def _to_tushare_ts_code(self, code: str) -> str:
         # 若已带后缀则直接返回；否则按首位判断交易所
