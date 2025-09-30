@@ -34,3 +34,31 @@ core/
 使用python后端(fastAPI) + Streamlit前端来实现， 前端通过REST/WS与后端交互。
 ## UI层
 
+
+---
+
+# 三层结构落地
+
+- 基础设施层(infrastructure):
+  - `infrastructure/db`: 连接/会话工厂、迁移管理。
+- 核心层(core):
+  - `core/model`, `core/dao`, `core/service`, `core/strategy`, `core/backtest`, `core/jobs`。
+- 接入层(后端+前端):
+  - 后端 `api/` (FastAPI)
+  - 前端 `webui/` (Streamlit)
+
+# 启动说明(占位)
+
+- 后端：
+```bash
+uvicorn api.app:app --reload
+```
+
+- 前端：
+```bash
+streamlit run webui/app.py
+```
+
+- 配置：
+  - 数据库/令牌等放在 `config.local.toml` 或环境变量
+

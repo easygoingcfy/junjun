@@ -6,3 +6,8 @@ tushare
 toml
 openpyxl
 requests
+
+# Web API & WebUI
+fastapi
+uvicorn[standard]
+streamlit
