@@ -26,26 +26,18 @@ class StrategyConfig:
     ma_alignment: Optional[str] = None  # None | "long"(多头) | "short"(空头)
     price_above_ma: Optional[int] = None  # 要求价格高于某条均线，如 20
 
-    # 4) 热度类（按日）
-    heat_min_news_count: Optional[int] = None
-    heat_days_window: int = 5  # 统计窗口
-
-    # 5) 板块类
-    board_in: List[str] = field(default_factory=list)  # 允许的板块代码/名称
-    board_not_in: List[str] = field(default_factory=list)  # 排除的板块
-
-    # 6) K线形态
+    # 4) K线形态
     enable_patterns: List[str] = field(default_factory=list)  # ["bullish_engulfing","hammer","shooting_star","doji","morning_star","evening_star"]
     pattern_window: int = 5
     pattern_params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # 7) 突破与波动过滤
+    # 5) 突破与波动过滤
     breakout_n: Optional[int] = None  # N日新高突破
     breakout_min_pct: Optional[float] = None  # 突破幅度下限（%）
     atr_period: Optional[int] = None  # ATR周期，开启则计算
     atr_max_pct_of_price: Optional[float] = None  # ATR/价格 百分比上限，用于过滤高波动
 
-    # 8) 动量指标
+    # 6) 动量指标
     macd_enable: Optional[bool] = None
     macd_fast: int = 12
     macd_slow: int = 26
@@ -73,24 +65,6 @@ class StockSelector:
         """
         df = pd.read_sql_query(q, self.conn, params=(ts_code, start, end))
         return df
-
-    def _load_board_codes(self, ts_code: str) -> List[str]:
-        q = """
-        SELECT DISTINCT board_code
-        FROM board_member
-        WHERE ts_code=?
-        """
-        rows = self.conn.execute(q, (ts_code,)).fetchall()
-        return [r[0] for r in rows]
-
-    def _load_heat(self, ts_code: str, start: str, end: str) -> pd.DataFrame:
-        q = """
-        SELECT date, IFNULL(news_count,0) AS news_count
-        FROM heat_data
-        WHERE ts_code=? AND date>=? AND date<=?
-        ORDER BY date ASC
-        """
-        return pd.read_sql_query(q, self.conn, params=(ts_code, start, end))
 
     def _calc_ma(self, s: pd.Series, n: int) -> pd.Series:
         return s.rolling(n, min_periods=1).mean()
@@ -157,28 +131,6 @@ class StockSelector:
             ok = ok and (not recent.empty and recent.max() >= cfg.exists_day_increase_min_pct)
         return ok
 
-    def _heat_signal(self, ts_code: str, start: str, end: str, cfg: StrategyConfig) -> bool:
-        if cfg.heat_min_news_count is None:
-            return True
-        heat = self._load_heat(ts_code, start, end)
-        if heat.empty:
-            return False
-        if cfg.heat_days_window:
-            heat = heat.tail(cfg.heat_days_window)
-        return (heat['news_count'].max() >= cfg.heat_min_news_count) or (heat['news_count'].sum() >= cfg.heat_min_news_count)
-
-    def _board_signal(self, ts_code: str, cfg: StrategyConfig) -> bool:
-        if not cfg.board_in and not cfg.board_not_in:
-            return True
-        codes = self._load_board_codes(ts_code)
-        if cfg.board_in:
-            if not any(b in codes for b in cfg.board_in):
-                return False
-        if cfg.board_not_in:
-            if any(b in codes for b in cfg.board_not_in):
-                return False
-        return True
-
     def _pattern_signal(self, df: pd.DataFrame, cfg: StrategyConfig) -> bool:
         if not cfg.enable_patterns:
             return True
@@ -239,8 +191,6 @@ class StockSelector:
             "volume": self._volume_signal(df, cfg),
             "ma": self._ma_system_signal(df, cfg),
             "range": self._range_increase_signal(df, cfg),
-            "heat": self._heat_signal(ts_code, start, end, cfg),
-            "board": self._board_signal(ts_code, cfg),
             "pattern": self._pattern_signal(df, cfg),
             "breakout": self._breakout_signal(df, cfg),
             "atr": self._atr_filter(df, cfg),

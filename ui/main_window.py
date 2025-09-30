@@ -1,9 +1,29 @@
-from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget, QTableWidgetItem, QLineEdit, QHBoxLayout, QDateEdit, QMessageBox
+from PyQt5.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QPushButton,
+    QLabel,
+    QTableWidget,
+    QTableWidgetItem,
+    QLineEdit,
+    QHBoxLayout,
+    QDateEdit,
+    QMessageBox,
+    QSplitter,
+    QScrollArea,
+    QHeaderView,
+    QProgressBar,
+    QAction,
+    QStatusBar,
+)
 from PyQt5.QtCore import QDate
+import pandas as pd
 from ui.plot_window import PlotWindow
 from ui.backtest_window import BacktestWindow
 from db.database import Database
 from data.fetcher import DataFetcher
+from data.save_data import DataSaver
 from strategy.selector import StockSelector, StrategyConfig
 from PyQt5.QtWidgets import QGroupBox, QCheckBox, QRadioButton, QSpinBox, QComboBox
 # 新增用于详情弹窗的组件
@@ -11,6 +31,7 @@ from PyQt5.QtWidgets import QDialog, QTextEdit, QDialogButtonBox, QFileDialog
 # 新增：用于颜色与对齐
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import QApplication
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -19,38 +40,113 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
         self.db = Database()
         self.fetcher = DataFetcher()
+        self.saver = DataSaver(self.db)
         self.selector = StockSelector(self.db.conn)
+        self.latest_trade_date: str | None = None
+        self.refresh_latest_trade_date()
         self.init_ui()
+
+    def refresh_latest_trade_date(self) -> str | None:
+        try:
+            row = self.db.conn.execute("SELECT MAX(trade_date) FROM daily_kline").fetchone()
+            self.latest_trade_date = row[0] if row and row[0] else None
+        except Exception:
+            self.latest_trade_date = None
+        return self.latest_trade_date
+
+    def _latest_trade_qdate(self):
+        if not self.latest_trade_date:
+            return None
+        return QDate.fromString(self.latest_trade_date, "yyyyMMdd")
+
+    def _format_date(self, value: str | None) -> str:
+        if not value:
+            return "无"
+        dt = QDate.fromString(value, "yyyyMMdd")
+        return dt.toString("yyyy-MM-dd") if dt.isValid() else value
+
+    def update_info_label(self, extra: str = ""):
+        base = f"数据库最新交易日: {self._format_date(self.latest_trade_date)}"
+        if extra:
+            base = f"{base} | {extra}"
+        if hasattr(self, "info_label"):
+            self.info_label.setText(base)
 
     def init_ui(self):
         central = QWidget()
-        main_layout = QVBoxLayout()
+        root_layout = QVBoxLayout()
+        central.setLayout(root_layout)
+        self.setCentralWidget(central)
 
-        # 屏蔽前缀勾选区
-        block_group = QGroupBox("屏蔽股票前缀")
-        block_layout = QHBoxLayout()
+        # 添加菜单栏
+        menubar = self.menuBar()
+        data_menu = menubar.addMenu("数据")
+
+        fetch_list_action = QAction("更新股票列表", self)
+        fetch_list_action.triggered.connect(self.on_fetch_data)
+        data_menu.addAction(fetch_list_action)
+
+        fetch_kline_action = QAction("更新全部K线数据", self)
+        fetch_kline_action.triggered.connect(self.on_fetch_kline_data)
+        data_menu.addAction(fetch_kline_action)
+
+        # 状态栏
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.statusBar.addPermanentWidget(self.progress_bar)
+
+        self.info_label = QLabel()
+        root_layout.addWidget(self.info_label)
+
+        btn_layout = QHBoxLayout()
+        self.select_btn = QPushButton("执行选股")
+        self.export_btn = QPushButton("导出选股结果")
+        self.detail_btn = QPushButton("查看详情")
+        self.bt_run_btn = QPushButton("运行回测")
+        self.bt_export_btn = QPushButton("导出回测明细")
+        for btn in [self.select_btn, self.export_btn, self.detail_btn, self.bt_run_btn, self.bt_export_btn]:
+            btn_layout.addWidget(btn)
+        btn_layout.addStretch()
+        root_layout.addLayout(btn_layout)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root_layout.addWidget(splitter, 1)
+
+        filter_scroll = QScrollArea()
+        filter_scroll.setWidgetResizable(True)
+        filter_widget = QWidget()
+        filter_layout = QVBoxLayout()
+        filter_layout.setContentsMargins(6, 6, 6, 6)
+        filter_layout.setSpacing(12)
+        filter_widget.setLayout(filter_layout)
+
+        basic_group = QGroupBox("基础设置")
+        basic_layout = QVBoxLayout()
+        prefix_layout = QHBoxLayout()
+        prefix_layout.addWidget(QLabel("屏蔽股票前缀:"))
         self.prefix_checkboxes = []
         for prefix in ["30", "68", "4", "8"]:
             cb = QCheckBox(prefix)
-            cb.setChecked(True)
+            cb.setChecked(False)
             self.prefix_checkboxes.append(cb)
-            block_layout.addWidget(cb)
-        block_group.setLayout(block_layout)
-        main_layout.addWidget(block_group)
+            prefix_layout.addWidget(cb)
+        prefix_layout.addStretch()
+        basic_layout.addLayout(prefix_layout)
 
-        # 日期选择区
-        date_group = QGroupBox("日期区间")
         date_layout = QHBoxLayout()
+        date_layout.addWidget(QLabel("时间范围:"))
         self.radio_recent = QRadioButton("最近N天")
         self.radio_recent.setChecked(True)
         self.spin_recent = QSpinBox()
         self.spin_recent.setRange(1, 365)
-        self.spin_recent.setValue(20)
+        self.spin_recent.setValue(60)
         self.radio_custom = QRadioButton("自定义区间")
-        self.date_start = QDateEdit(QDate.currentDate().addDays(-20))
-        self.date_end = QDateEdit(QDate.currentDate())
-        self.date_start.setEnabled(False)
-        self.date_end.setEnabled(False)
+        self.date_start = QDateEdit()
+        self.date_start.setCalendarPopup(True)
+        self.date_end = QDateEdit()
+        self.date_end.setCalendarPopup(True)
         date_layout.addWidget(self.radio_recent)
         date_layout.addWidget(self.spin_recent)
         date_layout.addWidget(self.radio_custom)
@@ -58,33 +154,37 @@ class MainWindow(QMainWindow):
         date_layout.addWidget(self.date_start)
         date_layout.addWidget(QLabel("结束:"))
         date_layout.addWidget(self.date_end)
-        date_group.setLayout(date_layout)
-        main_layout.addWidget(date_group)
+        date_layout.addStretch()
+        basic_layout.addLayout(date_layout)
+        basic_group.setLayout(basic_layout)
+        filter_layout.addWidget(basic_group)
 
-        # 涨幅筛选（区间与存在单日）
-        filter_group = QGroupBox("涨幅筛选")
-        filter_layout = QHBoxLayout()
+        self.range_group = QGroupBox("涨幅筛选")
+        self.range_group.setCheckable(True)
+        self.range_group.setChecked(False)
+        range_layout = QHBoxLayout()
         self.pct_input = QLineEdit()
         self.pct_input.setPlaceholderText("区间累计涨幅大于(%)，如8")
-        filter_layout.addWidget(QLabel("区间累计涨幅大于:"))
-        filter_layout.addWidget(self.pct_input)
         self.single_pct_input = QLineEdit()
         self.single_pct_input.setPlaceholderText("单日涨幅大于(%)，如8")
-        filter_layout.addWidget(QLabel("单日涨幅大于:"))
-        filter_layout.addWidget(self.single_pct_input)
         self.single_days_spin = QSpinBox()
         self.single_days_spin.setRange(1, 365)
         self.single_days_spin.setValue(20)
-        filter_layout.addWidget(QLabel("在最近N天内:"))
-        filter_layout.addWidget(self.single_days_spin)
-        filter_group.setLayout(filter_layout)
-        main_layout.addWidget(filter_group)
+        range_layout.addWidget(QLabel("区间≥"))
+        range_layout.addWidget(self.pct_input)
+        range_layout.addWidget(QLabel("单日≥"))
+        range_layout.addWidget(self.single_pct_input)
+        range_layout.addWidget(QLabel("最近N日:"))
+        range_layout.addWidget(self.single_days_spin)
+        self.range_group.setLayout(range_layout)
+        filter_layout.addWidget(self.range_group)
 
-        # 成交量策略
-        vol_group = QGroupBox("成交量")
+        self.volume_group = QGroupBox("成交量")
+        self.volume_group.setCheckable(True)
+        self.volume_group.setChecked(False)
         vol_layout = QHBoxLayout()
         self.volume_mode = QComboBox()
-        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])  # None | volume_breakout | volume_pullback
+        self.volume_mode.addItems(["无", "放量突破", "缩量回调"])
         self.volume_ma_days = QSpinBox()
         self.volume_ma_days.setRange(1, 60)
         self.volume_ma_days.setValue(5)
@@ -92,7 +192,6 @@ class MainWindow(QMainWindow):
         self.volume_ratio_min.setPlaceholderText("放量阈值，如1.5")
         self.volume_ratio_max = QLineEdit()
         self.volume_ratio_max.setPlaceholderText("缩量阈值，如0.7")
-        # 缩量回调细化
         self.cb_pullback_red = QCheckBox("回调需收阴")
         self.touch_ma_spin = QSpinBox()
         self.touch_ma_spin.setRange(0, 250)
@@ -106,107 +205,33 @@ class MainWindow(QMainWindow):
         vol_layout.addWidget(QLabel("缩量≤:"))
         vol_layout.addWidget(self.volume_ratio_max)
         vol_layout.addWidget(self.cb_pullback_red)
-        vol_layout.addWidget(QLabel("回踩MA(N=0关闭):"))
+        vol_layout.addWidget(QLabel("回踩MA:"))
         vol_layout.addWidget(self.touch_ma_spin)
-        vol_group.setLayout(vol_layout)
-        main_layout.addWidget(vol_group)
+        self.volume_group.setLayout(vol_layout)
+        filter_layout.addWidget(self.volume_group)
 
-        # 均线系统
-        ma_group = QGroupBox("均线系统")
+        self.ma_group = QGroupBox("均线系统")
+        self.ma_group.setCheckable(True)
+        self.ma_group.setChecked(False)
         ma_layout = QHBoxLayout()
         self.ma_days_input = QLineEdit("5,10,20")
         self.ma_align_combo = QComboBox()
-        self.ma_align_combo.addItems(["无", "多头", "空头"])  # None | long | short
+        self.ma_align_combo.addItems(["无", "多头", "空头"])
         self.price_above_ma_spin = QSpinBox()
         self.price_above_ma_spin.setRange(0, 250)
         self.price_above_ma_spin.setValue(0)
-        ma_layout.addWidget(QLabel("MA天数(逗号):"))
+        ma_layout.addWidget(QLabel("MA天数:"))
         ma_layout.addWidget(self.ma_days_input)
         ma_layout.addWidget(QLabel("排列:"))
         ma_layout.addWidget(self.ma_align_combo)
-        ma_layout.addWidget(QLabel("价格在N日MA之上(0为关闭):"))
+        ma_layout.addWidget(QLabel("价>MA(N):"))
         ma_layout.addWidget(self.price_above_ma_spin)
-        ma_group.setLayout(ma_layout)
-        main_layout.addWidget(ma_group)
+        self.ma_group.setLayout(ma_layout)
+        filter_layout.addWidget(self.ma_group)
 
-        # 热度
-        heat_group = QGroupBox("热度(新闻条数)")
-        heat_layout = QHBoxLayout()
-        self.heat_min_news = QSpinBox()
-        self.heat_min_news.setRange(0, 100000)
-        self.heat_min_news.setValue(0)
-        self.heat_window = QSpinBox()
-        self.heat_window.setRange(1, 60)
-        self.heat_window.setValue(5)
-        heat_layout.addWidget(QLabel("最小新闻数:"))
-        heat_layout.addWidget(self.heat_min_news)
-        heat_layout.addWidget(QLabel("统计窗口N:"))
-        heat_layout.addWidget(self.heat_window)
-        heat_group.setLayout(heat_layout)
-        main_layout.addWidget(heat_group)
-
-        # 突破/波动/动量
-        tech_group = QGroupBox("技术条件")
-        tech_layout = QHBoxLayout()
-        # 突破
-        self.breakout_n_spin = QSpinBox()
-        self.breakout_n_spin.setRange(0, 250)
-        self.breakout_n_spin.setValue(0)
-        self.breakout_min_pct = QLineEdit()
-        self.breakout_min_pct.setPlaceholderText("突破最小幅度% 可空")
-        # ATR过滤
-        self.atr_period_spin = QSpinBox()
-        self.atr_period_spin.setRange(0, 250)
-        self.atr_period_spin.setValue(0)
-        self.atr_max_pct = QLineEdit()
-        self.atr_max_pct.setPlaceholderText("ATR/价 ≤ % 可空")
-        # MACD
-        self.cb_macd = QCheckBox("MACD")
-        self.macd_rule = QComboBox()
-        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
-        # RSI
-        self.cb_rsi = QCheckBox("RSI")
-        self.rsi_period_spin = QSpinBox()
-        self.rsi_period_spin.setRange(1, 250)
-        self.rsi_period_spin.setValue(14)
-        self.rsi_min = QLineEdit()
-        self.rsi_min.setPlaceholderText("RSI≥ 可空")
-        self.rsi_max = QLineEdit()
-        self.rsi_max.setPlaceholderText("RSI≤ 可空")
-        # 布局
-        tech_layout.addWidget(QLabel("N日新高N:"))
-        tech_layout.addWidget(self.breakout_n_spin)
-        tech_layout.addWidget(QLabel("最小突破%:"))
-        tech_layout.addWidget(self.breakout_min_pct)
-        tech_layout.addWidget(QLabel("ATR周期:"))
-        tech_layout.addWidget(self.atr_period_spin)
-        tech_layout.addWidget(QLabel("ATR/价≤%:"))
-        tech_layout.addWidget(self.atr_max_pct)
-        tech_layout.addWidget(self.cb_macd)
-        tech_layout.addWidget(self.macd_rule)
-        tech_layout.addWidget(self.cb_rsi)
-        tech_layout.addWidget(self.rsi_period_spin)
-        tech_layout.addWidget(self.rsi_min)
-        tech_layout.addWidget(self.rsi_max)
-        tech_group.setLayout(tech_layout)
-        main_layout.addWidget(tech_group)
-
-        # 板块
-        board_group = QGroupBox("板块")
-        board_layout = QHBoxLayout()
-        self.board_in_input = QLineEdit()
-        self.board_in_input.setPlaceholderText("包含板块代码/名称，逗号分隔")
-        self.board_out_input = QLineEdit()
-        self.board_out_input.setPlaceholderText("排除板块代码/名称，逗号分隔")
-        board_layout.addWidget(QLabel("包含:"))
-        board_layout.addWidget(self.board_in_input)
-        board_layout.addWidget(QLabel("排除:"))
-        board_layout.addWidget(self.board_out_input)
-        board_group.setLayout(board_layout)
-        main_layout.addWidget(board_group)
-
-        # K线形态
-        pattern_group = QGroupBox("K线形态")
+        self.pattern_group = QGroupBox("K线形态")
+        self.pattern_group.setCheckable(True)
+        self.pattern_group.setChecked(False)
         pattern_layout = QHBoxLayout()
         self.cb_engulf = QCheckBox("吞没")
         self.cb_hammer = QCheckBox("锤子线")
@@ -219,12 +244,53 @@ class MainWindow(QMainWindow):
         pattern_layout.addWidget(self.cb_hammer)
         pattern_layout.addWidget(self.cb_shoot)
         pattern_layout.addWidget(self.cb_doji)
-        pattern_layout.addWidget(QLabel("检测最近N根:"))
+        pattern_layout.addWidget(QLabel("最近N根:"))
         pattern_layout.addWidget(self.pattern_window_spin)
-        pattern_group.setLayout(pattern_layout)
-        main_layout.addWidget(pattern_group)
+        self.pattern_group.setLayout(pattern_layout)
+        filter_layout.addWidget(self.pattern_group)
 
-        # 评分权重配置
+        self.tech_group = QGroupBox("技术指标")
+        self.tech_group.setCheckable(True)
+        self.tech_group.setChecked(False)
+        tech_layout = QHBoxLayout()
+        self.breakout_n_spin = QSpinBox()
+        self.breakout_n_spin.setRange(0, 250)
+        self.breakout_n_spin.setValue(0)
+        self.breakout_min_pct = QLineEdit()
+        self.breakout_min_pct.setPlaceholderText("突破最小幅度%")
+        self.atr_period_spin = QSpinBox()
+        self.atr_period_spin.setRange(0, 250)
+        self.atr_period_spin.setValue(0)
+        self.atr_max_pct = QLineEdit()
+        self.atr_max_pct.setPlaceholderText("ATR/价≤%")
+        self.cb_macd = QCheckBox("MACD")
+        self.macd_rule = QComboBox()
+        self.macd_rule.addItems(["hist>0", "dif>dea", "金叉"])
+        self.cb_rsi = QCheckBox("RSI")
+        self.rsi_period_spin = QSpinBox()
+        self.rsi_period_spin.setRange(1, 250)
+        self.rsi_period_spin.setValue(14)
+        self.rsi_min = QLineEdit()
+        self.rsi_min.setPlaceholderText("RSI≥")
+        self.rsi_max = QLineEdit()
+        self.rsi_max.setPlaceholderText("RSI≤")
+        tech_layout.addWidget(QLabel("N日新高:"))
+        tech_layout.addWidget(self.breakout_n_spin)
+        tech_layout.addWidget(QLabel("最小突破%:"))
+        tech_layout.addWidget(self.breakout_min_pct)
+        tech_layout.addWidget(QLabel("ATR周期:"))
+        tech_layout.addWidget(self.atr_period_spin)
+        tech_layout.addWidget(QLabel("ATR过滤%:"))
+        tech_layout.addWidget(self.atr_max_pct)
+        tech_layout.addWidget(self.cb_macd)
+        tech_layout.addWidget(self.macd_rule)
+        tech_layout.addWidget(self.cb_rsi)
+        tech_layout.addWidget(self.rsi_period_spin)
+        tech_layout.addWidget(self.rsi_min)
+        tech_layout.addWidget(self.rsi_max)
+        self.tech_group.setLayout(tech_layout)
+        filter_layout.addWidget(self.tech_group)
+
         weight_group = QGroupBox("评分权重（仅对启用项计分，自动归一化到100）")
         weight_layout = QHBoxLayout()
         self.weight_vol = QSpinBox()
@@ -260,9 +326,8 @@ class MainWindow(QMainWindow):
         weight_layout.addWidget(self.weight_rsi)
         weight_layout.addWidget(self.btn_reset_weights)
         weight_group.setLayout(weight_layout)
-        main_layout.addWidget(weight_group)
+        filter_layout.addWidget(weight_group)
 
-        # 回测配置
         bt_group = QGroupBox("回测配置")
         bt_layout = QHBoxLayout()
         self.bt_lookback = QSpinBox()
@@ -277,11 +342,10 @@ class MainWindow(QMainWindow):
         self.bt_topk = QSpinBox()
         self.bt_topk.setRange(0, 200)
         self.bt_topk.setValue(0)
-        # 新增：买卖模式与涨停过滤
         self.bt_entry_mode = QComboBox()
-        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])  # close | next_open
+        self.bt_entry_mode.addItems(["当日收盘买入", "次日开盘买入"])
         self.bt_exit_mode = QComboBox()
-        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])  # close | open
+        self.bt_exit_mode.addItems(["n日后收盘卖出", "n日后开盘卖出"])
         self.bt_exclude_limit = QCheckBox("排除信号日涨停")
         self.bt_limit_th = QSpinBox()
         self.bt_limit_th.setRange(0, 20)
@@ -292,7 +356,7 @@ class MainWindow(QMainWindow):
         bt_layout.addWidget(self.bt_forward)
         bt_layout.addWidget(QLabel("单边手续费‰:"))
         bt_layout.addWidget(self.bt_fee_bps)
-        bt_layout.addWidget(QLabel("每日TopK(0不限):"))
+        bt_layout.addWidget(QLabel("每日TopK:"))
         bt_layout.addWidget(self.bt_topk)
         bt_layout.addWidget(self.bt_entry_mode)
         bt_layout.addWidget(self.bt_exit_mode)
@@ -300,73 +364,126 @@ class MainWindow(QMainWindow):
         bt_layout.addWidget(QLabel("涨停阈值%:"))
         bt_layout.addWidget(self.bt_limit_th)
         bt_group.setLayout(bt_layout)
-        main_layout.addWidget(bt_group)
+        filter_layout.addWidget(bt_group)
 
-        # 按钮区
-        btn_layout = QHBoxLayout()
-        self.fetch_btn = QPushButton("获取全部股票")
-        self.select_btn = QPushButton("执行选股")
-        self.export_btn = QPushButton("导出选股结果")
-        self.detail_btn = QPushButton("查看详情")
-        self.bt_run_btn = QPushButton("运行回测")
-        self.bt_export_btn = QPushButton("导出回测明细")
-        btn_layout.addWidget(self.fetch_btn)
-        btn_layout.addWidget(self.select_btn)
-        btn_layout.addWidget(self.export_btn)
-        btn_layout.addWidget(self.detail_btn)
-        btn_layout.addWidget(self.bt_run_btn)
-        btn_layout.addWidget(self.bt_export_btn)
-        main_layout.addLayout(btn_layout)
+        filter_layout.addStretch(1)
+        filter_scroll.setWidget(filter_widget)
+        splitter.addWidget(filter_scroll)
 
-        # 信息与表格
-        self.info_label = QLabel("欢迎使用A股选股分析工具")
-        main_layout.addWidget(self.info_label)
-        # 扩展结果列：+ 通过明细、评分、未来5日收益%
+        table_panel = QWidget()
+        table_layout = QVBoxLayout()
+        table_panel.setLayout(table_layout)
         self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"])
-        # 启用排序（按列点击排序），评分列将按数值排序
+        self.table.setHorizontalHeaderLabels([
+            "代码", "名称", "行业", "收盘价", "区间涨幅", "单日最大涨幅", "单日最大跌幅", "通过明细", "评分", "未来5日收益%"
+        ])
         self.table.setSortingEnabled(True)
-        main_layout.addWidget(self.table)
+        header = self.table.horizontalHeader()
+        for idx in range(self.table.columnCount()):
+            if idx <= 2:
+                header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
+            else:
+                header.setSectionResizeMode(idx, QHeaderView.Stretch)
+        table_layout.addWidget(self.table)
+        splitter.addWidget(table_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 840])
 
-        central.setLayout(main_layout)
-        self.setCentralWidget(central)
+        latest_q = self._latest_trade_qdate()
+        if latest_q and latest_q.isValid():
+            self.date_end.setDate(latest_q)
+            self.date_start.setDate(latest_q.addDays(-self.spin_recent.value()))
+        else:
+            today = QDate.currentDate()
+            self.date_end.setDate(today)
+            self.date_start.setDate(today.addDays(-self.spin_recent.value()))
+        self.toggle_date_mode()
 
-        # 交互逻辑
-        self.fetch_btn.clicked.connect(self.on_fetch_data)
         self.select_btn.clicked.connect(self.on_select_stock)
+        self.export_btn.clicked.connect(self.on_export_excel)
+        self.detail_btn.clicked.connect(self.on_view_detail)
+        self.bt_run_btn.clicked.connect(self.on_run_backtest)
+        self.bt_export_btn.clicked.connect(self.on_export_backtest)
         self.table.cellDoubleClicked.connect(self.on_plot_kline)
         self.radio_recent.toggled.connect(self.toggle_date_mode)
         self.radio_custom.toggled.connect(self.toggle_date_mode)
-        self.export_btn.clicked.connect(self.on_export_excel)
-        self.detail_btn.clicked.connect(self.on_view_detail)
         self.btn_reset_weights.clicked.connect(self.on_reset_weights)
-        self.bt_run_btn.clicked.connect(self.on_run_backtest)
-        self.bt_export_btn.clicked.connect(self.on_export_backtest)
 
-    def on_export_excel(self):
-        import pandas as pd
-        from PyQt5.QtWidgets import QFileDialog
-        row_count = self.table.rowCount()
-        col_count = self.table.columnCount()
-        if row_count == 0:
-            QMessageBox.information(self, "提示", "无可导出的数据！")
-            return
-        data = []
-        headers = [self.table.horizontalHeaderItem(i).text() for i in range(col_count)]
-        for i in range(row_count):
-            row = []
-            for j in range(col_count):
-                item = self.table.item(i, j)
-                row.append(item.text() if item else "")
-            data.append(row)
-        df = pd.DataFrame(data, columns=headers)
-        file_path, _ = QFileDialog.getSaveFileName(self, "保存为Excel", "选股结果.xlsx", "Excel Files (*.xlsx)")
-        if file_path:
-            try:
-                df.to_excel(file_path, index=False)
-                QMessageBox.information(self, "导出成功", f"已导出到: {file_path}")
-            except Exception as e:
-                QMessageBox.warning(self, "导出失败", f"导出Excel失败: {e}")
+        self.update_info_label("欢迎使用A股选股分析工具")
+        self.on_fetch_data()
+
+    def on_fetch_kline_data(self):
+        try:
+            stock_df = self.fetcher.fetch_stock_list(from_db_conn=self.db.conn)
+            if stock_df is None or stock_df.empty:
+                QMessageBox.warning(self, "无数据", "请先获取股票列表。")
+                return
+
+            # 确定更新日期范围
+            latest = self.refresh_latest_trade_date()
+            if latest:
+                latest_q = QDate.fromString(latest, "yyyyMMdd")
+                start_q = latest_q.addDays(1) if latest_q.isValid() else QDate(2020, 1, 1)
+            else:
+                start_q = QDate(2020, 1, 1)
+
+            if not start_q.isValid():
+                start_q = QDate(2020, 1, 1)
+
+            end_q = QDate.currentDate()
+            if start_q > end_q:
+                self.progress_bar.setValue(0)
+                self.progress_bar.setVisible(False)
+                self.statusBar.showMessage("K线数据已是最新，无需更新。", 5000)
+                QMessageBox.information(self, "提示", "数据库中的K线数据已是最新。")
+                return
+
+            start_date = start_q.toString("yyyyMMdd")
+            end_date = end_q.toString("yyyyMMdd")
+
+            ts_codes = stock_df['ts_code'].tolist()
+            total = len(ts_codes)
+            if total == 0:
+                self.progress_bar.setValue(0)
+                self.progress_bar.setVisible(False)
+                self.statusBar.showMessage("未找到任何股票代码。", 5000)
+                QMessageBox.information(self, "提示", "股票列表为空，无法更新K线数据。")
+                return
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(True)
+            self.statusBar.showMessage(f"开始更新K线数据，从 {start_date} 到 {end_date}...")
+
+            # 定义进度回调
+            def progress_callback(code, stage):
+                current_index = min(self.progress_bar.value() + 1, total)
+                self.statusBar.showMessage(f"正在处理 {code}: {stage} ({current_index}/{total})")
+                QApplication.processEvents()
+
+            for i, ts_code in enumerate(ts_codes):
+                self.statusBar.showMessage(f"正在更新 {ts_code} ({i + 1}/{total})")
+                kline_df = self.fetcher.fetch_daily_kline(ts_code, start_date, end_date, progress_callback)
+
+                if kline_df is not None and not kline_df.empty:
+                    self.saver.save_daily_kline(ts_code, kline_df)
+                    self.statusBar.showMessage(f"{ts_code} 更新完成 ({i + 1}/{total})")
+                else:
+                    self.statusBar.showMessage(f"{ts_code} 无新增数据 ({i + 1}/{total})")
+
+                # 更新主进度
+                self.progress_bar.setValue(i + 1)
+                QApplication.processEvents() # 保持UI响应
+
+            self.progress_bar.setVisible(False)
+            self.statusBar.showMessage("全部K线数据更新完成。", 5000)
+            self.refresh_latest_trade_date()
+            self.update_info_label(f"全部K线数据更新完成，共{total}只股票。")
+
+        except Exception as e:
+            self.progress_bar.setVisible(False)
+            self.statusBar.showMessage("K线数据更新失败。", 5000)
+            QMessageBox.critical(self, "更新失败", f"更新K线数据时发生错误: {e}")
 
     def toggle_date_mode(self):
         is_recent = self.radio_recent.isChecked()
@@ -374,91 +491,145 @@ class MainWindow(QMainWindow):
         self.date_start.setEnabled(not is_recent)
         self.date_end.setEnabled(not is_recent)
 
-    def get_block_prefix(self):
+    def get_block_prefix(self) -> list[str]:
         return [cb.text() for cb in self.prefix_checkboxes if cb.isChecked()]
 
-    def get_date_range(self):
+    def get_date_range(self) -> tuple[str, str, list[str]]:
+        notes = []
+        latest_q = self._latest_trade_qdate()
+
         if self.radio_recent.isChecked():
             days = self.spin_recent.value()
-            end = QDate.currentDate()
+            if latest_q and latest_q.isValid():
+                end = latest_q
+            else:
+                end = QDate.currentDate()
+                notes.append("未检测到交易日数据，已使用今日日期")
             start = end.addDays(-days)
         else:
             start = self.date_start.date()
             end = self.date_end.date()
-        return start.toString("yyyyMMdd"), end.toString("yyyyMMdd")
+            if latest_q and latest_q.isValid() and end > latest_q:
+                end = latest_q
+                self.date_end.setDate(end)
+                notes.append(f"结束日期已调整为 {end.toString('yyyy-MM-dd')}")
+            if start > end:
+                start = end
+                self.date_start.setDate(start)
+                notes.append("起始日期已自动调整不晚于结束日期")
+        start_str = start.toString("yyyyMMdd")
+        end_str = end.toString("yyyyMMdd")
+        return start_str, end_str, notes
 
     def build_strategy_config(self, start: str, end: str) -> StrategyConfig:
-        # 涨幅
-        range_min_pct = float(self.pct_input.text().strip() or 0)
-        single_min_pct = float(self.single_pct_input.text().strip() or 0)
-        single_days = int(self.single_days_spin.value())
-        # 成交量
+        def parse_float(value: str | None) -> float | None:
+            if value is None:
+                return None
+            txt = str(value).strip()
+            if not txt:
+                return None
+            try:
+                return float(txt)
+            except ValueError:
+                return None
+
+        range_min_pct = None
+        single_min_pct = None
+        single_days = None
+        if self.range_group.isChecked():
+            range_min_val = parse_float(self.pct_input.text())
+            if range_min_val is not None and range_min_val > 0:
+                range_min_pct = range_min_val
+            tmp_single = parse_float(self.single_pct_input.text())
+            if tmp_single is not None and tmp_single > 0:
+                single_min_pct = tmp_single
+                single_days = int(self.single_days_spin.value())
+
         mode_map = {"无": None, "放量突破": "volume_breakout", "缩量回调": "volume_pullback"}
-        vmode = mode_map.get(self.volume_mode.currentText())
+        vmode = None
         v_ma_days = int(self.volume_ma_days.value())
-        v_min = self.volume_ratio_min.text().strip()
-        v_max = self.volume_ratio_max.text().strip()
-        v_min = float(v_min) if v_min else None
-        v_max = float(v_max) if v_max else None
-        # 均线
-        ma_days = [int(x) for x in self.ma_days_input.text().replace('，',',').split(',') if x.strip().isdigit()]
+        v_min = None
+        v_max = None
+        pullback_red = None
+        touch_ma = None
+        if self.volume_group.isChecked():
+            vmode = mode_map.get(self.volume_mode.currentText())
+            if vmode == "volume_breakout":
+                v_min = parse_float(self.volume_ratio_min.text())
+            elif vmode == "volume_pullback":
+                v_max = parse_float(self.volume_ratio_max.text())
+                pullback_red = True if self.cb_pullback_red.isChecked() else None
+                touch_ma_val = int(self.touch_ma_spin.value())
+                touch_ma = touch_ma_val if touch_ma_val > 0 else None
+            else:
+                vmode = None
+
+        ma_days = [int(x) for x in self.ma_days_input.text().replace('，', ',').split(',') if x.strip().isdigit()] or [5, 10, 20]
         align_map = {"无": None, "多头": "long", "空头": "short"}
-        ma_align = align_map.get(self.ma_align_combo.currentText())
-        price_above = int(self.price_above_ma_spin.value()) or None
-        # 热度
-        heat_min = int(self.heat_min_news.value()) or None
-        heat_win = int(self.heat_window.value())
-        # 板块
-        board_in = [x.strip() for x in self.board_in_input.text().replace('，',',').split(',') if x.strip()]
-        board_out = [x.strip() for x in self.board_out_input.text().replace('，',',').split(',') if x.strip()]
-        # 形态
+        ma_align = None
+        price_above = None
+        if self.ma_group.isChecked():
+            ma_align = align_map.get(self.ma_align_combo.currentText())
+            price_val = int(self.price_above_ma_spin.value())
+            price_above = price_val if price_val > 0 else None
+
         enable_patterns = []
-        if self.cb_engulf.isChecked():
-            enable_patterns.append('bullish_engulfing')
-        if self.cb_hammer.isChecked():
-            enable_patterns.append('hammer')
-        if self.cb_shoot.isChecked():
-            enable_patterns.append('shooting_star')
-        if self.cb_doji.isChecked():
-            enable_patterns.append('doji')
         pattern_window = int(self.pattern_window_spin.value())
-        # 成交量细化
-        pullback_red = True if self.cb_pullback_red.isChecked() else None
-        touch_ma = int(self.touch_ma_spin.value()) or None
-        # 技术指标
-        breakout_n = int(self.breakout_n_spin.value()) or None
-        breakout_min_pct = float(self.breakout_min_pct.text().strip()) if self.breakout_min_pct.text().strip() else None
-        atr_period = int(self.atr_period_spin.value()) or None
-        atr_max_pct = float(self.atr_max_pct.text().strip()) if self.atr_max_pct.text().strip() else None
-        macd_en = True if self.cb_macd.isChecked() else None
-        macd_rule = self.macd_rule.currentText() if self.cb_macd.isChecked() else None
-        rsi_en = True if self.cb_rsi.isChecked() else None
+        if self.pattern_group.isChecked():
+            if self.cb_engulf.isChecked():
+                enable_patterns.append('bullish_engulfing')
+            if self.cb_hammer.isChecked():
+                enable_patterns.append('hammer')
+            if self.cb_shoot.isChecked():
+                enable_patterns.append('shooting_star')
+            if self.cb_doji.isChecked():
+                enable_patterns.append('doji')
+        else:
+            pattern_window = 5
+
+        breakout_n = None
+        breakout_min_pct = None
+        atr_period = None
+        atr_max_pct = None
+        macd_en = None
+        macd_rule = None
+        rsi_en = None
         rsi_period = int(self.rsi_period_spin.value())
-        rsi_min = float(self.rsi_min.text().strip()) if self.rsi_min.text().strip() else None
-        rsi_max = float(self.rsi_max.text().strip()) if self.rsi_max.text().strip() else None
+        rsi_min = None
+        rsi_max = None
+        if self.tech_group.isChecked():
+            breakout_val = int(self.breakout_n_spin.value())
+            breakout_n = breakout_val if breakout_val > 0 else None
+            breakout_min_pct = parse_float(self.breakout_min_pct.text())
+            atr_period_val = int(self.atr_period_spin.value())
+            atr_period = atr_period_val if atr_period_val > 0 else None
+            atr_max_pct = parse_float(self.atr_max_pct.text())
+            if self.cb_macd.isChecked():
+                macd_en = True
+                macd_rule = self.macd_rule.currentText()
+            if self.cb_rsi.isChecked():
+                rsi_en = True
+                rsi_min = parse_float(self.rsi_min.text())
+                rsi_max = parse_float(self.rsi_max.text())
+        else:
+            rsi_period = int(self.rsi_period_spin.value())
 
-        range_days = None
-        if self.radio_recent.isChecked():
-            range_days = self.spin_recent.value()
+        range_days = self.spin_recent.value() if self.radio_recent.isChecked() else None
 
-        cfg = StrategyConfig(
+        return StrategyConfig(
             range_increase_days=range_days,
-            range_increase_min_pct=range_min_pct if range_min_pct > 0 else None,
-            exists_day_increase_within_days=single_days if single_min_pct > 0 else None,
-            exists_day_increase_min_pct=single_min_pct if single_min_pct > 0 else None,
+            range_increase_min_pct=range_min_pct,
+            exists_day_increase_within_days=single_days,
+            exists_day_increase_min_pct=single_min_pct,
             volume_mode=vmode,
             volume_ma_days=v_ma_days,
             volume_ratio_min=v_min,
             volume_ratio_max=v_max,
             pullback_require_red=pullback_red,
             pullback_touch_ma=touch_ma,
-            ma_days=ma_days or [5,10,20],
+            ma_days=ma_days,
             ma_alignment=ma_align,
             price_above_ma=price_above,
-            heat_min_news_count=heat_min,
-            heat_days_window=heat_win,
-            board_in=board_in,
-            board_not_in=board_out,
             enable_patterns=enable_patterns,
             pattern_window=pattern_window,
             pattern_params={},
@@ -473,30 +644,69 @@ class MainWindow(QMainWindow):
             rsi_min=rsi_min,
             rsi_max=rsi_max,
         )
-        return cfg
 
     def on_fetch_data(self):
-        stock_df = self.fetcher.fetch_stock_list()
-        self.table.setRowCount(len(stock_df))
-        for i, row in stock_df.iterrows():
-            ts_code = str(row['ts_code'])
-            name = str(row.get('name', ''))
-            industry = str(row.get('industry', ''))
-            # 查询最新收盘价
-            close_row = self.db.conn.execute(
-                "SELECT close FROM daily_kline WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (ts_code,)).fetchone()
-            close = f"{close_row[0]:.2f}" if close_row and close_row[0] is not None else "-"
-            self.table.setItem(i, 0, QTableWidgetItem(ts_code))
-            self.table.setItem(i, 1, QTableWidgetItem(name))
-            self.table.setItem(i, 2, QTableWidgetItem(industry))
-            self.table.setItem(i, 3, QTableWidgetItem(close))
-            self.table.setItem(i, 4, QTableWidgetItem("-"))
-            self.table.setItem(i, 5, QTableWidgetItem("-"))
-            self.table.setItem(i, 6, QTableWidgetItem("-"))
-            self.table.setItem(i, 7, QTableWidgetItem("-"))
-            self.table.setItem(i, 8, QTableWidgetItem("-"))
-            self.table.setItem(i, 9, QTableWidgetItem("-"))
-        self.info_label.setText(f"已加载股票数：{len(stock_df)}")
+        try:
+            # 统一使用无后缀代码
+            stock_df = self.fetcher.fetch_stock_list(from_db_conn=self.db.conn)
+            if stock_df is None or stock_df.empty:
+                QMessageBox.warning(self, "无数据", "无法获取股票列表，请检查数据库或网络。")
+                return
+
+            # 将最新列表写回数据库，保持信息同步
+            self.saver.save_stock_list(stock_df)
+
+            # 一次性批量查询每只股票的最新收盘价，避免逐行查询导致卡顿
+            # 利用 (ts_code, trade_date) 索引，先取每个代码的最新交易日，再连接拿到 close
+            close_rows = self.db.conn.execute(
+                """
+                SELECT dk.ts_code, dk.close
+                FROM daily_kline dk
+                JOIN (
+                    SELECT ts_code, MAX(trade_date) AS md
+                    FROM daily_kline
+                    GROUP BY ts_code
+                ) t ON dk.ts_code = t.ts_code AND dk.trade_date = t.md
+                """
+            ).fetchall()
+            # 将带后缀代码标准化为无后缀，构建映射
+            close_map = {}
+            for code_full, close_val in close_rows:
+                code_no = code_full.split('.')[0] if code_full and isinstance(code_full, str) else code_full
+                if code_no and (close_val is not None):
+                    close_map[code_no] = f"{float(close_val):.2f}"
+
+            # 创建一个代码到行的映射，用于后续快速查找
+            self.stock_list_map = {row['ts_code']: row for _, row in stock_df.iterrows()}
+
+            # 填充表格前先关闭排序以提升性能
+            was_sorting = self.table.isSortingEnabled()
+            if was_sorting:
+                self.table.setSortingEnabled(False)
+
+            self.table.setRowCount(len(stock_df))
+            for i, row in stock_df.iterrows():
+                ts_code = str(row['ts_code'])  # 已是无后缀
+                name = str(row.get('name', ''))
+                industry = str(row.get('industry', ''))
+                close = close_map.get(ts_code, "-")
+
+                self.table.setItem(i, 0, QTableWidgetItem(ts_code))
+                self.table.setItem(i, 1, QTableWidgetItem(name))
+                self.table.setItem(i, 2, QTableWidgetItem(industry))
+                self.table.setItem(i, 3, QTableWidgetItem(close))
+                # 初始化其他列为空白
+                for j in range(4, self.table.columnCount()):
+                    self.table.setItem(i, j, QTableWidgetItem("-"))
+
+            # 恢复排序
+            if was_sorting:
+                self.table.setSortingEnabled(True)
+
+            self.update_info_label(f"已加载股票数：{len(stock_df)}")
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"加载股票列表时发生错误: {e}")
+            self.update_info_label("加载股票列表失败")
 
     def on_reset_weights(self):
         self.weight_vol.setValue(30)
@@ -516,8 +726,9 @@ class MainWindow(QMainWindow):
                 stock_df = stock_df[~stock_df['ts_code'].str.startswith(tuple(block_prefix))]
             ts_codes = stock_df['ts_code'].tolist()
             # 时间与策略
-            start, end = self.get_date_range()
+            start, end, notes = self.get_date_range()
             cfg = self.build_strategy_config(start, end)
+            self.update_info_label("；".join(notes) if notes else "")
             # 参数
             lookback = int(self.bt_lookback.value())
             forward_n = int(self.bt_forward.value())
@@ -568,6 +779,41 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "导出成功", f"已导出到: {file_path}")
             except Exception as e:
                 QMessageBox.warning(self, "导出失败", f"导出失败: {e}")
+
+    def on_export_excel(self):
+        row_count = self.table.rowCount()
+        if row_count <= 0:
+            QMessageBox.information(self, "提示", "当前没有可导出的选股结果。")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出选股结果",
+            "stock_selection.xlsx",
+            "Excel Files (*.xlsx);;CSV Files (*.csv)"
+        )
+        if not file_path:
+            return
+
+        headers = [self.table.horizontalHeaderItem(col).text() for col in range(self.table.columnCount())]
+        data = []
+        for row in range(row_count):
+            row_values = []
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                row_values.append(item.text() if item else "")
+            data.append(row_values)
+
+        df = pd.DataFrame(data, columns=headers)
+
+        try:
+            if file_path.lower().endswith(".csv"):
+                df.to_csv(file_path, index=False, encoding="utf-8-sig")
+            else:
+                df.to_excel(file_path, index=False)
+            QMessageBox.information(self, "导出成功", f"选股结果已导出到:\n{file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"导出时发生错误: {e}")
 
     # 评分：按启用项的权重归一化到100分
     def _calc_score(self, checks: dict, cfg: StrategyConfig) -> float:
@@ -680,17 +926,6 @@ class MainWindow(QMainWindow):
             if cfg.exists_day_increase_within_days and cfg.exists_day_increase_min_pct is not None:
                 detail.append(f"{cfg.exists_day_increase_within_days}日内单日≥{cfg.exists_day_increase_min_pct}%")
             add_line("涨幅", checks.get('range', False), ", ".join(detail))
-        # 热度
-        if cfg.heat_min_news_count is not None:
-            add_line("热度", checks.get('heat', False), f"窗口{cfg.heat_days_window}, 最小{cfg.heat_min_news_count}")
-        # 板块
-        if cfg.board_in or cfg.board_not_in:
-            detail = []
-            if cfg.board_in:
-                detail.append("包含:" + "/".join(cfg.board_in))
-            if cfg.board_not_in:
-                detail.append("排除:" + "/".join(cfg.board_not_in))
-            add_line("板块", checks.get('board', False), ", ".join(detail))
         # 形态
         if cfg.enable_patterns:
             add_line("形态", checks.get('pattern', False), f"{','.join(cfg.enable_patterns)} | 窗口{cfg.pattern_window}")
@@ -735,9 +970,15 @@ class MainWindow(QMainWindow):
         dlg.exec_()
 
     def on_select_stock(self):
+        # 禁用所有策略组，用于基础流程测试
+        for group in [self.range_group, self.volume_group, self.ma_group, self.pattern_group, self.tech_group]:
+            group.setChecked(False)
+        
+        QMessageBox.information(self, "测试模式", "所有策略已临时禁用，将返回全部股票以测试流程。")
+
         # 读取筛选条件
         block_prefix = self.get_block_prefix()
-        start, end = self.get_date_range()
+        start, end, notes = self.get_date_range()
         cfg = self.build_strategy_config(start, end)
         # 查询股票列表并过滤前缀
         stock_df = self.fetcher.fetch_stock_list()
@@ -750,9 +991,14 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(passed))
         for i, r in passed.reset_index(drop=True).iterrows():
             ts_code = r['ts_code']
-            base = stock_df[stock_df['ts_code'] == ts_code].iloc[0] if not stock_df.empty else {}
-            name = str(base.get('name', '')) if isinstance(base, dict) else str(base.get('name', ''))
-            industry = str(base.get('industry', '')) if isinstance(base, dict) else str(base.get('industry', ''))
+            # 从内存中的映射快速查找，而不是遍历DataFrame
+            base = self.stock_list_map.get(ts_code)
+            if base is None:
+                name, industry = "-", "-"
+            else:
+                name = str(base.get('name', ''))
+                industry = str(base.get('industry', ''))
+            
             # 读取区间K线计算展示列
             kline_rows = self.db.conn.execute(
                 "SELECT trade_date, close, pct_chg FROM daily_kline WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date ASC",
@@ -798,12 +1044,15 @@ class MainWindow(QMainWindow):
                 item_ret.setToolTip("未来5日收益: 数据不足")
             self._style_return_item(item_ret, fwd5)
             self.table.setItem(i, 9, item_ret)
-        self.info_label.setText(f"筛选结果：{len(passed)} 只")
+        summary = f"筛选结果：{len(passed)} 只"
+        if notes:
+            summary = f"{summary} | {'；'.join(notes)}"
+        self.update_info_label(summary)
 
     def on_plot_kline(self, row, col):
         ts_code = self.table.item(row, 0).text()
         # 获取当前筛选的日期区间
-        start, end = self.get_date_range()
+        start, end, _ = self.get_date_range()
         kline = self.db.conn.execute(
             "SELECT trade_date, open, high, low, close, vol FROM daily_kline WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date ASC",
             (ts_code, start, end)).fetchall()

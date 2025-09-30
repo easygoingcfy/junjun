@@ -30,6 +30,8 @@ class Database:
             list_status TEXT
         )
         ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_info_ts_code ON stock_info (ts_code)')
+
         # 日线行情
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_kline (
@@ -52,73 +54,7 @@ class Database:
             UNIQUE(ts_code, trade_date)
         )
         ''')
-        # 概念表
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS concept (
-            concept_code TEXT PRIMARY KEY,
-            name TEXT,
-            source TEXT,
-            description TEXT
-        )
-        ''')
-        # 概念-成分股关系
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS concept_member (
-            concept_code TEXT,
-            ts_code TEXT,
-            in_date TEXT,
-            out_date TEXT,
-            PRIMARY KEY(concept_code, ts_code)
-        )
-        ''')
-        # 板块/指数表
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS board (
-            board_code TEXT PRIMARY KEY,
-            name TEXT,
-            type TEXT,
-            source TEXT
-        )
-        ''')
-        # 板块/指数成分
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS board_member (
-            board_code TEXT,
-            ts_code TEXT,
-            in_date TEXT,
-            out_date TEXT,
-            weight REAL,
-            PRIMARY KEY(board_code, ts_code)
-        )
-        ''')
-        # 板块/指数日线快照（用于板块热度）
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS board_daily (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            board_code TEXT,
-            date TEXT,
-            close REAL,
-            pct_chg REAL,
-            vol REAL,
-            amount REAL,
-            UNIQUE(board_code, date)
-        )
-        ''')
-        # 热度/情绪快照
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS heat_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_code TEXT,
-            date TEXT,
-            source TEXT,
-            news_count INTEGER,
-            search_score REAL,
-            forum_count INTEGER,
-            sentiment REAL,
-            board_hotness REAL,
-            UNIQUE(ts_code, date, source)
-        )
-        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_kline_ts_code_date ON daily_kline (ts_code, trade_date)')
 
         # 迁移：为已有表补充新增列
         # stock_info 新增列

@@ -37,34 +37,66 @@ class DataFetcher:
             return f"{code}.SH"
         return code
 
-    def fetch_stock_list(self) -> pd.DataFrame:
-        # 优先 TuShare 获取更全字段
+    def fetch_stock_list(self, from_db_conn=None) -> pd.DataFrame:
+        # 优先从数据库读取，避免重复网络请求
+        if from_db_conn:
+            try:
+                df = pd.read_sql("SELECT ts_code, name, industry FROM stock_info", from_db_conn)
+                if not df.empty:
+                    # 确保数据库返回的也没有后缀
+                    df['ts_code'] = df['ts_code'].str.split('.').str[0]
+                    return df
+            except Exception as e:
+                print(f"[DB] 读取股票列表失败: {e}")
+
+        # 其次 TuShare 获取更全字段
         if self.ts_pro:
             try:
                 df = self.ts_pro.stock_basic(fields='ts_code,symbol,name,area,industry,market,exchange,list_status,list_date,is_hs')
-                return df
+                if not df.empty:
+                    df['ts_code'] = df['ts_code'].str.split('.').str[0]
+                    return df
             except Exception:
                 pass
-        # 退化到 akshare
-        df = ak.stock_info_a_code_name()
-        df.rename(columns={'code': 'ts_code'}, inplace=True)
-        return df
+        
+        # 最后退化到 akshare
+        try:
+            df = ak.stock_info_a_code_name()
+            # akshare 的 code 列已经是无后缀的，只需重命名
+            df.rename(columns={'code': 'ts_code'}, inplace=True)
+            return df
+        except Exception as e:
+            print(f"[akshare] 股票列表获取失败: {e}")
+            return pd.DataFrame()
 
-    def fetch_daily_kline(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch_daily_kline(self, ts_code: str, start_date: str, end_date: str, progress_callback=None) -> pd.DataFrame:
         # 1. 主接口：TuShare
         if self.ts_pro:
             try:
                 tushare_code = self._to_tushare_ts_code(ts_code)
                 # 行情与基础合并
                 df = self.ts_pro.daily(ts_code=tushare_code, start_date=start_date, end_date=end_date)
+                if progress_callback:
+                    progress_callback(ts_code, "daily")
+                
                 basic = self.ts_pro.daily_basic(ts_code=tushare_code, start_date=start_date, end_date=end_date,
                                                 fields="ts_code,trade_date,turnover_rate,turnover_rate_f,volume_ratio,pe_ttm,pb,ps_ttm,total_mv,circ_mv")
+                if progress_callback:
+                    progress_callback(ts_code, "basic")
+
                 # 前收盘
                 adj = self.ts_pro.adj_factor(ts_code=tushare_code, start_date=start_date, end_date=end_date)
+                if progress_callback:
+                    progress_callback(ts_code, "adj")
+
                 # 合并
+                if df is None or df.empty:
+                     return pd.DataFrame()
+                
                 df = pd.merge(df, basic, on=['ts_code', 'trade_date'], how='left')
                 if adj is not None and not adj.empty:
                     df = pd.merge(df, adj[['trade_date', 'adj_factor']], on='trade_date', how='left')
+                
                 # 计算补充字段
                 df = df.sort_values('trade_date')
                 if 'pre_close' not in df.columns or df['pre_close'].isna().all():
@@ -73,6 +105,12 @@ class DataFetcher:
                 df['amplitude'] = (df['high'] - df['low']) / df['pre_close'] * 100
                 keep = ['trade_date', 'open', 'high', 'low', 'close', 'vol', 'amount', 'pct_chg', 'turnover_rate',
                         'pre_close', 'amplitude', 'volume_ratio', 'circ_mv', 'total_mv']
+                
+                # 确保所有列都存在
+                for col in keep:
+                    if col not in df.columns:
+                        df[col] = pd.NA
+                
                 if not df.empty:
                     return df[keep]
             except Exception as e:
@@ -88,6 +126,9 @@ class DataFetcher:
                 end_date=end_date,
                 adjust="qfq"
             )
+            if progress_callback:
+                progress_callback(ts_code, "akshare_hist")
+
             df.rename(columns={
                 '日期': 'trade_date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
                 '成交量': 'vol', '成交额': 'amount', '涨跌幅': 'pct_chg', '换手率': 'turnover_rate'
@@ -102,6 +143,12 @@ class DataFetcher:
             df['total_mv'] = pd.NA
             keep = ['trade_date', 'open', 'high', 'low', 'close', 'vol', 'amount', 'pct_chg', 'turnover_rate',
                     'pre_close', 'amplitude', 'volume_ratio', 'circ_mv', 'total_mv']
+            
+            # 确保所有列都存在
+            for col in keep:
+                if col not in df.columns:
+                    df[col] = pd.NA
+
             if not df.empty:
                 return df[keep]
         except Exception as e:
@@ -146,148 +193,6 @@ class DataFetcher:
         except Exception as e:
             print(f"[TuShare 交易日历失败] {start_date}-{end_date}: {e}")
             return pd.DataFrame()
-
-    # 概念相关
-    def fetch_concepts(self) -> pd.DataFrame:
-        # TuShare 概念列表
-        if self.ts_pro:
-            try:
-                df = self.ts_pro.concept()
-                df.rename(columns={'code': 'concept_code', 'name': 'name'}, inplace=True)
-                df['source'] = 'tushare'
-                return df[['concept_code', 'name', 'source']]
-            except Exception as e:
-                print(f"[TuShare 概念列表失败] {e}")
-        # 备选：akshare 概念名称（同花顺）
-        try:
-            df = ak.stock_board_concept_name_ths()
-            df.rename(columns={'板块代码': 'concept_code', '板块名称': 'name'}, inplace=True)
-            df['source'] = 'eastmoney'
-            return df[['concept_code', 'name', 'source']]
-        except Exception as e:
-            print(f"[akshare 概念名称失败] {e}")
-            return pd.DataFrame()
-
-    def fetch_concept_members(self, concept_code: str) -> pd.DataFrame:
-        # TuShare 概念成分
-        if self.ts_pro:
-            try:
-                df = self.ts_pro.concept_detail(id=concept_code)
-                df.rename(columns={'id': 'concept_code'}, inplace=True)
-                return df[['concept_code', 'ts_code']]
-            except Exception:
-                pass
-        # 备选：akshare 同花顺概念成分
-        try:
-            df = ak.stock_board_concept_cons_ths(symbol=concept_code)
-            if '代码' in df.columns:
-                df.rename(columns={'代码': 'symbol'}, inplace=True)
-            return df
-        except Exception as e:
-            print(f"[akshare 概念成分失败] {concept_code}: {e}")
-            return pd.DataFrame()
-
-    # 指数/板块（通用）
-    def fetch_boards(self) -> pd.DataFrame:
-        # 指数列表（上交所/深交所）
-        if self.ts_pro:
-            try:
-                idx = self.ts_pro.index_basic(market='SSE')
-                idx2 = self.ts_pro.index_basic(market='SZSE')
-                df = pd.concat([idx, idx2], ignore_index=True)
-                df['board_code'] = df['ts_code']
-                df['name'] = df['name']
-                df['type'] = 'index'
-                df['source'] = 'tushare'
-                return df[['board_code', 'name', 'type', 'source']]
-            except Exception:
-                pass
-        return pd.DataFrame()
-
-    def fetch_board_members(self, board_code: str) -> pd.DataFrame:
-        # 指数成分
-        if self.ts_pro:
-            try:
-                df = self.ts_pro.index_weight(index_code=board_code)
-                df.rename(columns={'con_code': 'ts_code', 'weight': 'weight'}, inplace=True)
-                return df[['ts_code', 'weight']]
-            except Exception:
-                pass
-        return pd.DataFrame()
-
-    def fetch_board_daily(self, board_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        # 使用 TuShare 指数日线，作为板块热度（pct_chg）
-        if self.ts_pro:
-            try:
-                df = self.ts_pro.index_daily(ts_code=board_code, start_date=start_date, end_date=end_date)
-                if not df.empty:
-                    df = df[['trade_date', 'close', 'pct_chg', 'vol', 'amount']].copy()
-                    df.rename(columns={'trade_date': 'date'}, inplace=True)
-                    return df
-            except Exception as e:
-                print(f"[TuShare 指数日线失败] {board_code}: {e}")
-        return pd.DataFrame()
-
-    # 行业板块（同花顺-东方财富数据）
-    def fetch_industry_boards_ths(self) -> pd.DataFrame:
-        try:
-            df = ak.stock_board_industry_name_ths()
-            # 统一为 board_code=板块名称，type=industry，source=eastmoney
-            df.rename(columns={'板块名称': 'name', '板块代码': 'em_code'}, inplace=True)
-            df['board_code'] = df['name']
-            df['type'] = 'industry'
-            df['source'] = 'eastmoney'
-            return df[['board_code', 'name', 'type', 'source']]
-        except Exception as e:
-            print(f"[行业板块列表失败] {e}")
-            return pd.DataFrame()
-
-    def fetch_industry_board_members_ths(self, board_name: str) -> pd.DataFrame:
-        try:
-            df = ak.stock_board_industry_cons_ths(symbol=board_name)
-            # 列通常包含 '代码','名称' 等
-            if '代码' in df.columns:
-                df.rename(columns={'代码': 'ts_code'}, inplace=True)
-            return df
-        except Exception as e:
-            print(f"[行业板块成分失败] {board_name}: {e}")
-            return pd.DataFrame()
-
-    def fetch_industry_board_daily_ths(self, board_name: str) -> pd.DataFrame:
-        try:
-            df = ak.stock_board_industry_hist_em(symbol=board_name)
-            # 字段：日期、收盘、涨跌幅、成交量、成交额
-            if df is not None and not df.empty:
-                df.rename(columns={'日期': 'date', '收盘': 'close', '涨跌幅': 'pct_chg', '成交量': 'vol', '成交额': 'amount'}, inplace=True)
-                # 统一日期格式 YYYYMMDD
-                df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.strftime('%Y%m%d')
-                return df[['date', 'close', 'pct_chg', 'vol', 'amount']]
-        except Exception as e:
-            print(f"[行业板块日线失败] {board_name}: {e}")
-        return pd.DataFrame()
-
-    # 新闻条数（热度）：使用 akshare 的新浪/东财新闻做简单按日计数
-    def fetch_daily_news_count(self, ts_code: str, date: str) -> int:
-        try:
-            code = ts_code.split('.')[0] if '.' in ts_code else ts_code
-            try:
-                news_df = ak.stock_news_em(period='近1月')
-                if news_df is not None and not news_df.empty:
-                    tail3 = code[-3:]
-                    tail4 = code[-4:]
-                    the_day = pd.to_datetime(date)
-                    # 兼容字段
-                    publish_col = '发布时间' if '发布时间' in news_df.columns else '时间'
-                    title_col = '标题' if '标题' in news_df.columns else 'title'
-                    news_df['datetime'] = pd.to_datetime(news_df[publish_col], errors='coerce')
-                    mask_date = news_df['datetime'].dt.strftime('%Y%m%d') == the_day.strftime('%Y%m%d')
-                    mask_kw = news_df[title_col].astype(str).str.contains(tail3) | news_df[title_col].astype(str).str.contains(tail4)
-                    return int((mask_date & mask_kw).sum())
-            except Exception:
-                pass
-        except Exception:
-            pass
-        return 0
 
     def _tscode_to_akshare(self, ts_code: str) -> str:
         code = ts_code.split('.')[0] if '.' in ts_code else ts_code
