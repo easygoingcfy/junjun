@@ -11,3 +11,4 @@ requests
 fastapi
 uvicorn[standard]
 streamlit
+plotly

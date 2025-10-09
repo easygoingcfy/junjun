@@ -88,3 +88,102 @@ class StrategyRepository:
 
 class SignalRepository:
     pass
+
+
+class IndustryRepository:
+    """行业统计仓储"""
+    def get_all_industries(self) -> List[dict]:
+        """获取所有行业列表"""
+        with get_session() as conn:
+            rows = conn.execute("SELECT DISTINCT industry FROM stock_info WHERE industry IS NOT NULL AND industry != ''").fetchall()
+            return [{"name": row[0], "id": row[0]} for row in rows]
+    
+    def get_industry_stats(self, days: int = 7) -> List[dict]:
+        """获取行业统计数据，按最近N天总成交量排序"""
+        with get_session() as conn:
+            # 获取最近N天的行业统计数据
+            # 先获取最新的几个交易日
+            latest_dates_query = """
+            SELECT DISTINCT trade_date 
+            FROM industry_stats 
+            ORDER BY trade_date DESC 
+            LIMIT ?
+            """
+            latest_dates = [row[0] for row in conn.execute(latest_dates_query, (days,)).fetchall()]
+            
+            if not latest_dates:
+                return []
+            
+            # 使用IN查询而不是日期减法
+            placeholders = ','.join(['?' for _ in latest_dates])
+            query = f"""
+            SELECT 
+                industry,
+                SUM(total_volume) as total_volume,
+                AVG(avg_pct_chg) as avg_pct_chg,
+                COUNT(DISTINCT trade_date) as days_count,
+                MAX(stock_count) as stock_count
+            FROM industry_stats 
+            WHERE trade_date IN ({placeholders})
+            GROUP BY industry
+            ORDER BY total_volume DESC
+            """
+            rows = conn.execute(query, latest_dates).fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "name": row[0],
+                    "total_volume": float(row[1]) if row[1] else 0,
+                    "avg_pct_chg": float(row[2]) if row[2] else 0,
+                    "days_count": row[3],
+                    "stock_count": row[4]
+                }
+                for row in rows
+            ]
+    
+    def get_stocks_by_industry(self, industry: str, sort_by: str = "volume", limit: int = 100) -> List[dict]:
+        """获取指定行业的股票列表，支持多种排序方式"""
+        with get_session() as conn:
+            # 构建排序字段
+            order_field = {
+                "volume": "sds.volume DESC",
+                "amount": "sds.amount DESC", 
+                "pct_chg": "sds.pct_chg DESC",
+                "turnover_rate": "sds.turnover_rate DESC"
+            }.get(sort_by, "sds.volume DESC")
+            
+            query = f"""
+            SELECT 
+                si.ts_code,
+                si.name,
+                si.industry,
+                dk.close,
+                sds.volume,
+                sds.amount,
+                sds.pct_chg,
+                sds.turnover_rate,
+                sds.amplitude
+            FROM stock_info si
+            LEFT JOIN daily_kline dk ON si.ts_code = dk.ts_code 
+                AND dk.trade_date = (SELECT MAX(trade_date) FROM daily_kline WHERE ts_code = si.ts_code)
+            LEFT JOIN stock_daily_stats sds ON si.ts_code = sds.ts_code 
+                AND sds.trade_date = (SELECT MAX(trade_date) FROM stock_daily_stats WHERE ts_code = si.ts_code)
+            WHERE si.industry = ?
+            ORDER BY {order_field}
+            LIMIT ?
+            """
+            rows = conn.execute(query, (industry, limit)).fetchall()
+            return [
+                {
+                    "ts_code": row[0].split('.')[0] if row[0] else row[0],
+                    "name": row[1],
+                    "industry": row[2],
+                    "close": float(row[3]) if row[3] else None,
+                    "volume": float(row[4]) if row[4] else 0,
+                    "amount": float(row[5]) if row[5] else 0,
+                    "pct_chg": float(row[6]) if row[6] else 0,
+                    "turnover_rate": float(row[7]) if row[7] else 0,
+                    "amplitude": float(row[8]) if row[8] else 0
+                }
+                for row in rows
+            ]
